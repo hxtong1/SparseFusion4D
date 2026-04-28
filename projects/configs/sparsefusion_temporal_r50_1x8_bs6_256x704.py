@@ -75,14 +75,20 @@ num_iters_per_epoch = int(28130 // (num_gpus * batch_size))
 num_epochs = 100
 checkpoint_epoch_interval = 20
 
-checkpoint_config = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval
-)
+# checkpoint_config = dict(
+#     interval=num_iters_per_epoch * checkpoint_epoch_interval
+# )
+# log_config = dict(
+#     interval=51,
+#     hooks=[
+#         dict(type="TextLoggerHook", by_epoch=False),
+#         dict(type="TensorboardLoggerHook"),
+#     ],
+# )
 log_config = dict(
-    interval=51,
+    interval=1,
     hooks=[
-        dict(type="TextLoggerHook", by_epoch=False),
-        dict(type="TensorboardLoggerHook"),
+        dict(type="TextLoggerHook"),
     ],
 )
 load_from = None
@@ -520,9 +526,13 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
+# runner = dict(
+#     type="IterBasedRunner",
+#     max_iters=num_iters_per_epoch * num_epochs,
+# )
 runner = dict(
     type="IterBasedRunner",
-    max_iters=num_iters_per_epoch * num_epochs,
+    max_iters=50
 )
 
 # ================== eval ========================
@@ -534,8 +544,14 @@ vis_pipeline = [
         meta_keys=["timestamp", "lidar2img"],
     ),
 ]
+# evaluation = dict(
+#     interval=num_iters_per_epoch * checkpoint_epoch_interval,
+#     pipeline=vis_pipeline,
+#     # out_dir="./vis",  # for visualization
+# )
+checkpoint_config = dict(interval=50)
+
 evaluation = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval,
+    interval=999999,
     pipeline=vis_pipeline,
-    # out_dir="./vis",  # for visualization
 )

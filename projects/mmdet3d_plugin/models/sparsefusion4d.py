@@ -157,7 +157,7 @@ class SparseFusion4D(MVXTwoStageDetector):
     def with_pts_neck(self):
         return hasattr(self, "pts_neck") and self.pts_neck is not None
 
-    @force_fp32(apply_to=("pts", "img_feats"))
+    # @force_fp32(apply_to=("img_feats"))
     def extract_pts_feat(self, pts, img_feats=None, img_metas=None):
         """Extract BEV features from point clouds."""
         if not self.with_pts_bbox:
@@ -179,6 +179,11 @@ class SparseFusion4D(MVXTwoStageDetector):
             coors,
         )
 
+        # Keep the LiDAR branch in FP32. Under fp16 training,
+        # SparseEncoder may output HalfTensor while SECOND/SECONDFPN
+        # weights remain FloatTensor.
+        voxel_features = voxel_features.float()
+
         batch_size = int(coors[-1, 0].item()) + 1
 
         x = self.pts_middle_encoder(
@@ -187,10 +192,24 @@ class SparseFusion4D(MVXTwoStageDetector):
             batch_size,
         )
 
+        x = x.float()
         x = self.pts_backbone(x)
+
+        # SECOND returns multi-scale features as tuple/list.
+        # Convert every feature map to fp32 before SECONDFPN.
+        if isinstance(x, (list, tuple)):
+            x = [feat.float() for feat in x]
+        else:
+            x = x.float()
 
         if self.with_pts_neck:
             x = self.pts_neck(x)
+
+        # SECONDFPN usually returns tuple/list as well.
+        if isinstance(x, (list, tuple)):
+            x = [feat.float() for feat in x]
+        else:
+            x = x.float()
 
         return x
 

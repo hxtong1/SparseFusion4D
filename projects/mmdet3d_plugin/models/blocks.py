@@ -357,8 +357,6 @@ class DeformableFeatureFusionAggregation(BaseModule):
     ):
 
         if pts_feats is not None:
-            for i, feat in enumerate(pts_feats):
-                print(i, feat.shape)
         bs, num_anchor = instance_feature.shape[:2]
         key_points = self.kps_generator(anchor, instance_feature)
         weights = self._get_weights(instance_feature, anchor_embed, metas)
@@ -406,12 +404,14 @@ class DeformableFeatureFusionAggregation(BaseModule):
             )  # [B, N, C]
 
 
-            lidar_features = self.lidar_output_proj(lidar_features)
+            lidar_features = self.lidar_output_proj(lidar_features.float())
 
             if self.lidar_gated:
                 lidar_gate = self.lidar_gate(instance_feature)
+                lidar_features = lidar_features.to(features.dtype)
                 features = features * (1.0 - lidar_gate) + lidar_features * lidar_gate
             else:
+                lidar_features = lidar_features.to(features.dtype)
                 features = features + lidar_features
 
         output = self.proj_drop(self.output_proj(features))
@@ -520,7 +520,7 @@ class DeformableFeatureFusionAggregation(BaseModule):
             pts_feats = [pts_feats]
 
         # 当前你只有一层 CMT BEV feature: [B, 256, 128, 128]
-        bev_feat = pts_feats[0]
+        bev_feat = pts_feats[0].float()
 
         grid = self.bev_project(key_points)  # [B, N, P, 2]
 

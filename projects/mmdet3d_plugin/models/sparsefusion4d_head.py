@@ -189,14 +189,16 @@ class SparseFusion4DHead(BaseModule):
             if isinstance(pts_feats, torch.Tensor):
                 pts_feats = [pts_feats]
 
+            # Keep LiDAR BEV features in fp32 before Conv2d adapter.
+            # Otherwise fp16 hooks may cast feature maps to half while
+            # pts_adapter weights stay fp32.
             pts_feats = [
-                self.pts_adapter(x) for x in pts_feats
+                self.pts_adapter(x.float()) for x in pts_feats
             ]
 
+            pts_feats = [x.float() for x in pts_feats]
             metas["pts_feats"] = pts_feats
 
-            for i, feat in enumerate(pts_feats):
-                print(i, feat.shape)
 
         # ========= get instance info ============
         if (
