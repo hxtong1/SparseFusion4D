@@ -1,0 +1,19 @@
+*.pyc
+*.npy
+*.pth
+tmp/
+data/
+.vscode/
+# build artifacts
+*.so
+*.o
+*.egg-info/
+build/
+__pycache__/
+*.pyc
+
+# local generated files
+*.npy
+*.pkl
+work_dirs/
+outputs/
