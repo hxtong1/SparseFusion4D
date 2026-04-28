@@ -356,7 +356,6 @@ class DeformableFeatureFusionAggregation(BaseModule):
         **kwargs: dict,
     ):
 
-        if pts_feats is not None:
         bs, num_anchor = instance_feature.shape[:2]
         key_points = self.kps_generator(anchor, instance_feature)
         weights = self._get_weights(instance_feature, anchor_embed, metas)
