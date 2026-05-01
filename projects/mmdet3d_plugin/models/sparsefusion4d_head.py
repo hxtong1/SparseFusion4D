@@ -53,9 +53,10 @@ class SparseFusion4DHead(BaseModule):
         init_cfg: dict = None,
 
         # ===== LiDAR BEV feature adapter =====
-        use_pts_feat: bool = True,
+        use_pts_feat: bool = False,
         pts_in_channels: int = 512,
         pts_out_channels: int = 256,
+        use_lidar_prior_query: bool = True,
         **kwargs,
     ):
         super(SparseFusion4DHead, self).__init__(init_cfg)
@@ -115,6 +116,7 @@ class SparseFusion4DHead(BaseModule):
         )
         self.embed_dims = self.instance_bank.embed_dims
         self.use_pts_feat = use_pts_feat
+        self.use_lidar_prior_query = use_lidar_prior_query
         self.pts_adapter = None
         if self.use_pts_feat:
             self.pts_adapter = nn.Conv2d(
@@ -145,6 +147,42 @@ class SparseFusion4DHead(BaseModule):
         for m in self.modules():
             if hasattr(m, "init_weight"):
                 m.init_weight()
+
+    def merge_lidar_prior_query(
+        self,
+        anchor,
+        instance_feature,
+        lidar_prior_info,
+    ):
+        if lidar_prior_info is None:
+            return anchor, instance_feature, 0
+
+        prior_anchor = lidar_prior_info["anchors"]
+        prior_feature = lidar_prior_info["instance_feats"]
+
+        anchor_dim = anchor.shape[-1]
+        feat_dim = instance_feature.shape[-1]
+
+        if prior_anchor.shape[-1] < anchor_dim:
+            pad = prior_anchor.new_zeros(
+                *prior_anchor.shape[:-1],
+                anchor_dim - prior_anchor.shape[-1],
+            )
+            prior_anchor = torch.cat([prior_anchor, pad], dim=-1)
+        elif prior_anchor.shape[-1] > anchor_dim:
+            prior_anchor = prior_anchor[..., :anchor_dim]
+
+        if prior_feature.shape[-1] != feat_dim:
+            raise RuntimeError(
+                f"LiDAR prior feature dim {prior_feature.shape[-1]} "
+                f"!= instance feature dim {feat_dim}"
+            )
+
+        anchor = torch.cat([anchor, prior_anchor], dim=1)
+        instance_feature = torch.cat([instance_feature, prior_feature], dim=1)
+
+        return anchor, instance_feature, prior_anchor.shape[1]
+
 
     def graph_model(
         self,
@@ -215,6 +253,26 @@ class SparseFusion4DHead(BaseModule):
         ) = self.instance_bank.get(
             batch_size, metas, dn_metas=self.sampler.dn_metas
         )
+
+        num_bank_anchor = anchor.shape[1]
+        num_lidar_prior = 0
+
+        # print("[DEBUG] before merge anchor:", anchor.shape)
+        # print("[DEBUG] lidar prior info is None:", metas.get("lidar_prior_info", None) is None)
+
+        if self.use_lidar_prior_query:
+            anchor, instance_feature, num_lidar_prior = self.merge_lidar_prior_query(
+                anchor,
+                instance_feature,
+                metas.get("lidar_prior_info", None),
+            )
+
+
+
+        # print("[DEBUG] num_bank_anchor:", num_bank_anchor)
+        # print("[DEBUG] num_lidar_prior:", num_lidar_prior)
+        # print("[DEBUG] merged anchor:", anchor.shape)
+        # print("[DEBUG] merged instance_feature:", instance_feature.shape)
 
         # ========= prepare for denosing training ============
         # 1. get dn metas: noisy-anchors and corresponding GT
@@ -317,7 +375,7 @@ class SparseFusion4DHead(BaseModule):
                     anchor_embed,
                     feature_maps,
                     metas,
-                    pts_feats=metas.get("pts_feats", None),
+                    # pts_feats=metas.get("pts_feats", None),
                 )
             elif op == "refine":
                 anchor, cls, qt = self.layers[i](
@@ -335,9 +393,61 @@ class SparseFusion4DHead(BaseModule):
                 classification.append(cls)
                 quality.append(qt)
                 if len(prediction) == self.num_single_frame_decoder:
-                    instance_feature, anchor = self.instance_bank.update(
-                        instance_feature, anchor, cls
-                    )
+                    if num_lidar_prior > 0:
+                        # prior_instance_feature = instance_feature[:, :num_lidar_prior]
+                        # prior_anchor = anchor[:, :num_lidar_prior]
+                        # prior_cls = cls[:, :num_lidar_prior] if cls is not None else None
+
+                        bank_instance_feature = instance_feature[:, :num_bank_anchor]
+                        bank_anchor = anchor[:, :num_bank_anchor]
+                        bank_cls = cls[:, :num_bank_anchor] if cls is not None else None
+
+                        prior_instance_feature = instance_feature[
+                            :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        ]
+                        prior_anchor = anchor[
+                            :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        ]
+                        prior_cls = cls[
+                            :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        ] if cls is not None else None
+
+                        # prior_instance_feature = instance_feature[
+                        #     :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        # ]
+                        # prior_anchor = anchor[
+                        #     :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        # ]
+                        # prior_cls = cls[
+                        #     :, num_bank_anchor:num_bank_anchor + num_lidar_prior
+                        # ] if cls is not None else None
+
+                        bank_instance_feature, bank_anchor = self.instance_bank.update(
+                            bank_instance_feature,
+                            bank_anchor,
+                            bank_cls,
+                        )
+
+                        instance_feature = torch.cat(
+                            [bank_instance_feature, prior_instance_feature],
+                            dim=1,
+                        )
+                        anchor = torch.cat(
+                            [bank_anchor, prior_anchor],
+                            dim=1,
+                        )
+                        # if cls is not None and bank_cls is not None:
+                        #     cls = torch.cat([prior_cls, bank_cls], dim=1)
+
+                        if cls is not None:
+                            cls = torch.cat([bank_cls, prior_cls], dim=1)
+                    else:
+                        instance_feature, anchor = self.instance_bank.update(
+                            instance_feature, anchor, cls
+                        )                    
+                    # instance_feature, anchor = self.instance_bank.update(
+                    #     instance_feature, anchor, cls
+                    # )
                     if (
                         dn_metas is not None
                         and self.sampler.num_temp_dn_groups > 0
@@ -427,15 +537,42 @@ class SparseFusion4DHead(BaseModule):
                 "quality": quality,
             }
         )
+        cache_instance_feature = instance_feature
+        cache_anchor = anchor
+        cache_cls = cls
 
-        # cache current instances for temporal modeling
+        if num_lidar_prior > 0:
+            cache_instance_feature = instance_feature[:, :num_bank_anchor]
+            cache_anchor = anchor[:, :num_bank_anchor]
+            cache_cls = cls[:, :num_bank_anchor] if cls is not None else None
+
         self.instance_bank.cache(
-            instance_feature, anchor, cls, metas, feature_maps
-        )
-        if not self.training:
-            instance_id = self.instance_bank.get_instance_id(
-                cls, anchor, self.decoder.score_threshold
+            cache_instance_feature,
+            cache_anchor,
+            cache_cls,
+            metas,
+            feature_maps,
             )
+        # cache current instances for temporal modeling
+        # self.instance_bank.cache(
+        #     instance_feature, anchor, cls, metas, feature_maps
+        # )
+
+        if not self.training:
+            id_cls = cls
+            id_anchor = anchor
+            if num_lidar_prior > 0:
+                id_cls = cls[:, :num_bank_anchor]
+                id_anchor = anchor[:, :num_bank_anchor]
+
+            instance_id = self.instance_bank.get_instance_id(
+                id_cls,
+                id_anchor,
+                self.decoder.score_threshold,
+            )
+            # instance_id = self.instance_bank.get_instance_id(
+            #     cls, anchor, self.decoder.score_threshold
+            # )
             output["instance_id"] = instance_id
         return output
 

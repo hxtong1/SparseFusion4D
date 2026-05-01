@@ -316,7 +316,7 @@ class DeformableFeatureFusionAggregation(BaseModule):
         self.pc_range = pc_range
         self.use_lidar_feat = use_lidar_feat
         self.lidar_gated = lidar_gated
-
+        
         if self.use_lidar_feat:
             self.lidar_output_proj = Linear(embed_dims, embed_dims)
 
@@ -327,6 +327,7 @@ class DeformableFeatureFusionAggregation(BaseModule):
                     nn.Linear(embed_dims, embed_dims),
                     nn.Sigmoid(),
                 )
+                nn.init.constant_(self.lidar_gate[-2].bias, -8.0)
 
         if use_camera_embed:
             self.camera_encoder = Sequential(
@@ -403,15 +404,26 @@ class DeformableFeatureFusionAggregation(BaseModule):
             )  # [B, N, C]
 
 
-            lidar_features = self.lidar_output_proj(lidar_features.float())
+            # lidar_features = self.lidar_output_proj(lidar_features.float())
+            lidar_features = lidar_features.float()
+
+            if lidar_features.shape[-1] != self.embed_dims:
+                raise RuntimeError(
+                    f"[DFFA] expected lidar_features dim={self.embed_dims}, "
+                    f"but got {lidar_features.shape[-1]}"
+                )
+
+            lidar_features = self.lidar_output_proj(lidar_features)
+            lidar_features = lidar_features.to(features.dtype)
 
             if self.lidar_gated:
-                lidar_gate = self.lidar_gate(instance_feature)
-                lidar_features = lidar_features.to(features.dtype)
-                features = features * (1.0 - lidar_gate) + lidar_features * lidar_gate
+                lidar_gate = self.lidar_gate(features.float())
+                lidar_gate = lidar_gate.to(features.dtype)
+
+                # residual adapter，不替换原图像特征
+                features = features + lidar_gate * lidar_features
             else:
-                lidar_features = lidar_features.to(features.dtype)
-                features = features + lidar_features
+                features = features + 0.001 * lidar_features
 
         output = self.proj_drop(self.output_proj(features))
         output = self.proj_drop(self.output_proj(features))

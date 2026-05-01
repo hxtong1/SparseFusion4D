@@ -9,6 +9,11 @@ from .blocks import (
     AsymmetricFFN,
 )
 from .instance_bank import InstanceBank
+from .lidar_cross_attn import LiDARBEVCrossAttention
+from .lidar_prior_query import LiDARPriorQueryGenerator
+from .lidar_temporal_fusion import LiDARTemporalFusion
+from .center_head import SparseFusionCenterHead
+from .lidar_center_head import LidarSparseFusionCenterHead
 from .detection3d import (
     SparseBox3DDecoder,
     SparseBox3DTarget,
@@ -33,4 +38,9 @@ __all__ = [
     "SparseBox3DRefinementModule",
     "SparseBox3DKeyPointsGenerator",
     "SparseBox3DEncoder",
+    "LiDARBEVCrossAttention",
+    "LiDARPriorQueryGenerator",
+    "LiDARTemporalFusion",
+    "SparseFusionCenterHead",
+    "LidarSparseFusionCenterHead",
 ]

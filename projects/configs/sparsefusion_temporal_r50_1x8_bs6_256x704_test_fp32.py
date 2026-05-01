@@ -59,13 +59,13 @@ plugin_dir = "projects/mmdet3d_plugin/"
 dist_params = dict(backend="nccl")
 log_level = "INFO"
 work_dir = None
-# find_unused_parameters = True
+
 # point_cloud_range = [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
 point_cloud_range = [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
 voxel_size = [0.1, 0.1, 0.2]
 out_size_factor = 8
 
-grid_size = [1024, 1024, 40]
+grid_size = [1080, 1080, 40]
 sparse_shape = [41, 1024, 1024]
 bev_feat_shape = [128, 128]
 
@@ -76,33 +76,26 @@ num_iters_per_epoch = int(28130 // (num_gpus * batch_size))
 num_epochs = 100
 checkpoint_epoch_interval = 20
 
-checkpoint_config = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval
-)
-log_config = dict(
-    interval=100,
-    hooks=[
-        dict(type="TextLoggerHook", by_epoch=False),
-        dict(type="TensorboardLoggerHook"),
-    ],
-)
+# checkpoint_config = dict(
+#     interval=num_iters_per_epoch * checkpoint_epoch_interval
+# )
 # log_config = dict(
-#     interval=50,
+#     interval=51,
 #     hooks=[
-#         dict(type="TextLoggerHook"),
+#         dict(type="TextLoggerHook", by_epoch=False),
+#         dict(type="TensorboardLoggerHook"),
 #     ],
 # )
+log_config = dict(
+    interval=50,
+    hooks=[
+        dict(type="TextLoggerHook"),
+    ],
+)
 load_from = None
 resume_from = None
 workflow = [("train", 1)]
-import sys
-
-_is_test = any("test.py" in arg or "dist_test.sh" in arg for arg in sys.argv)
-
-if _is_test:
-    fp16 = None
-else:
-    fp16 = dict(loss_scale=32.0)
+fp16 = None  # disable fp16 during test because spconv implicit_gemm may fail in eval
 input_shape = (704, 256)
 
 tracking_test = True
@@ -135,6 +128,10 @@ drop_out = 0.1
 temporal = True
 decouple_attn = True
 with_quality_estimation = True
+
+use_lidar_prior=True,
+detach_lidar_prior=True,
+lidar_prior_loss_weight=1.0,
 
 model = dict(
     type="SparseFusion4D",
@@ -202,11 +199,8 @@ model = dict(
         norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
-    use_lidar_prior=True,
-    detach_lidar_prior=True,
-    lidar_prior_loss_weight=1.0,
     lidar_prior_head=dict(
-        type="LidarSparseFusionCenterHead",
+        type="LidarSparseFusionCenterHead",  # 用你已经实现并注册到 HEADS 的类名
         in_channels=512,
         tasks=[
             dict(
@@ -284,7 +278,7 @@ model = dict(
         type="SparseFusion4DHead",
         cls_threshold_to_reg=0.05,
         decouple_attn=decouple_attn,
-        use_pts_feat=False,
+        use_pts_feat=True,
         pts_in_channels=512,
         pts_out_channels=256,
         instance_bank=dict(
@@ -366,7 +360,7 @@ model = dict(
             use_camera_embed=True,
             residual_mode="cat",
             pc_range=point_cloud_range,
-            use_lidar_feat=False,
+            use_lidar_feat=True,
             lidar_gated=False,
             kps_generator=dict(
                 type="SparseBox3DKeyPointsGenerator",
@@ -391,9 +385,8 @@ model = dict(
         ),
         sampler=dict(
             type="SparseBox3DTarget",
-            num_dn_groups=0,
-            num_temp_dn_groups=0,
-
+            num_dn_groups=5,
+            num_temp_dn_groups=3,
             dn_noise_scale=[2.0] * 3 + [0.5] * 7,
             max_dn_gt=32,
             add_neg_dn=True,
@@ -601,6 +594,11 @@ optimizer = dict(
     type="AdamW",
     lr=6e-4,
     weight_decay=0.001,
+    paramwise_cfg=dict(
+        custom_keys={
+            "img_backbone": dict(lr_mult=0.5),
+        }
+    ),
 )
 optimizer_config = dict(grad_clip=dict(max_norm=25, norm_type=2))
 lr_config = dict(
@@ -633,9 +631,9 @@ vis_pipeline = [
 #     pipeline=vis_pipeline,
 #     # out_dir="./vis",  # for visualization
 # )
-evaluation = dict(
-    interval=3000,
-    pipeline=test_pipeline,
-#     # out_dir="./vis",  # for visualization
-)
 checkpoint_config = dict(interval=1000)
+
+evaluation = dict(
+    interval=999999,
+    pipeline=vis_pipeline,
+)

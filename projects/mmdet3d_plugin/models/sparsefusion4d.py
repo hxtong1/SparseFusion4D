@@ -5,6 +5,8 @@ import torch
 import torch.nn.functional as F
 from mmcv.runner import force_fp32, auto_fp16
 from mmcv.utils import build_from_cfg
+
+from mmdet.models import HEADS
 from mmcv.cnn.bricks.registry import PLUGIN_LAYERS
 from mmdet.models import (
     DETECTORS,
@@ -13,6 +15,8 @@ from mmdet.models import (
     build_head,
     build_neck,
 )
+
+from mmdet3d.models.builder import HEADS as MMDET3D_HEADS
 from mmdet3d.models.builder import (
     build_voxel_encoder,
     build_middle_encoder,
@@ -56,6 +60,12 @@ class SparseFusion4D(MVXTwoStageDetector):
         pts_middle_encoder=None,
         pts_backbone=None,
         pts_neck=None,
+        
+        # ===== LiDAR prior query branch =====
+        lidar_prior_head=None,
+        use_lidar_prior=False,
+        detach_lidar_prior=True,
+        lidar_prior_loss_weight=1.0,
     ):
         super(SparseFusion4D, self).__init__(init_cfg=init_cfg)
         if pretrained is not None:
@@ -68,6 +78,8 @@ class SparseFusion4D(MVXTwoStageDetector):
             self.img_neck = None
         self.head = build_head(head)
 
+        if getattr(self, "freeze_sparse4d_lidar_stage1", False):
+            self.freeze_sparse4d_for_lidar_stage1()
         # ===== LiDAR branch =====
         self.pts_voxel_layer = None
         self.pts_voxel_encoder = None
@@ -99,6 +111,24 @@ class SparseFusion4D(MVXTwoStageDetector):
                 pts_neck
             )
 
+        self.use_lidar_prior = use_lidar_prior
+        self.detach_lidar_prior = detach_lidar_prior
+        self.lidar_prior_loss_weight = lidar_prior_loss_weight
+
+        self.lidar_prior_head = (
+            build_from_cfg(lidar_prior_head, MMDET3D_HEADS)
+            if lidar_prior_head is not None else None
+        )
+
+        if self.use_lidar_prior:
+            assert self.lidar_prior_head is not None, \
+                "use_lidar_prior=True requires lidar_prior_head."
+
+        if self.detach_lidar_prior and self.lidar_prior_head is not None:
+            if hasattr(self.lidar_prior_head, "cls_embedding"):
+                for p in self.lidar_prior_head.cls_embedding.parameters():
+                    p.requires_grad = False
+
         self.use_grid_mask = use_grid_mask
         if use_deformable_func:
             assert DAF_VALID, "deformable_aggregation needs to be set up."
@@ -115,6 +145,34 @@ class SparseFusion4D(MVXTwoStageDetector):
             self.grid_mask = GridMask(
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
             )
+
+    def detach_prior_info(self, prior_info):
+        """Detach LiDAR prior info.
+
+        In stage-1 training, Sparse4D loss should not back-propagate
+        through LiDAR prior query generation.
+        """
+        if prior_info is None:
+            return None
+
+        detached_prior_info = {}
+        for k, v in prior_info.items():
+            if torch.is_tensor(v):
+                detached_prior_info[k] = v.detach()
+            elif isinstance(v, (list, tuple)):
+                detached_prior_info[k] = type(v)(
+                    item.detach() if torch.is_tensor(item) else item
+                    for item in v
+                )
+            elif isinstance(v, dict):
+                detached_prior_info[k] = {
+                    kk: vv.detach() if torch.is_tensor(vv) else vv
+                    for kk, vv in v.items()
+                }
+            else:
+                detached_prior_info[k] = v
+
+        return detached_prior_info
 
     def _format_points(self, points):
         """Convert collated LiDARPoints into list[Tensor]."""
@@ -290,13 +348,6 @@ class SparseFusion4D(MVXTwoStageDetector):
         metas=None,
         img_metas=None,
     ):
-        """Extract image and point cloud features.
-
-        Returns:
-            img_feats: multi-view image features.
-            pts_feats: LiDAR BEV features.
-            depths: optional depth predictions.
-        """
         if return_depth:
             img_feats, depths = self.extract_img_feat(
                 img,
@@ -311,11 +362,13 @@ class SparseFusion4D(MVXTwoStageDetector):
             )
             depths = None
 
-        pts_feats = self.extract_pts_feat(
-            points,
-            img_feats=img_feats,
-            img_metas=img_metas,
-        )
+        pts_feats = None
+        if self.use_lidar_prior:
+            pts_feats = self.extract_pts_feat(
+                points,
+                img_feats=img_feats,
+                img_metas=img_metas,
+            )
 
         if return_depth:
             return img_feats, pts_feats, depths
@@ -323,17 +376,14 @@ class SparseFusion4D(MVXTwoStageDetector):
         return img_feats, pts_feats
 
     @force_fp32(apply_to=("img",))
-    def forward(self, img, **data):
+    def forward(self, img, points, **data):
         if self.training:
-            return self.forward_train(img, **data)
+            return self.forward_train(img, points, **data)
         else:
-            return self.forward_test(img, **data)
+            return self.forward_test(img, points, **data)
 
-    def forward_train(self, img, **data):
-        # 1. 从 data 中取出点云输入
-        points = data.get("points", None)
+    def forward_train(self, img, points, **data):
 
-        # 2. 同时提取 image feature、lidar feature 和 depth
         feature_maps, pts_feats, depths = self.extract_feat(
             img=img,
             points=points,
@@ -341,33 +391,98 @@ class SparseFusion4D(MVXTwoStageDetector):
             metas=data,
             img_metas=data.get("img_metas", None),
         )
+        
+        loss_dict = {}
 
-        # 3. 将 LiDAR BEV feature 放入 data，供 head / fusion module 使用
-        data["pts_feats"] = pts_feats
+
+        lidar_prior_info = None
+
+        if self.use_lidar_prior:
+
+            lidar_preds = self.lidar_prior_head(pts_feats)
+
+            # 独立 LiDAR CenterHead loss
+            lidar_loss_dict = self.lidar_prior_head.loss_by_feat(
+                preds_dicts=lidar_preds,
+                gt_bboxes_3d=data["gt_bboxes_3d"],
+                gt_labels_3d=data["gt_labels_3d"],
+                img_metas=data.get("img_metas", None),
+            )
+
+            for k, v in lidar_loss_dict.items():
+                loss_dict[f"lidar_prior.{k}"] = v * self.lidar_prior_loss_weight
+
+            # decode成 Sparse4D prior query
+            lidar_prior_info = self.lidar_prior_head.decode_lidar(
+                lidar_preds,
+                feats=pts_feats,
+                metainfo=data,
+            )
+
+            # if lidar_prior_info is not None:
+            #     print("[DEBUG] lidar_prior anchors:", lidar_prior_info["anchors"].shape)
+            #     print("[DEBUG] lidar_prior feats:", lidar_prior_info["instance_feats"].shape)
+            #     print("[DEBUG] lidar_prior scores:", lidar_prior_info["scores"].shape)
+            #     print("[DEBUG] lidar_prior labels:", lidar_prior_info["labels"].shape)
+
+            if self.detach_lidar_prior:
+                lidar_prior_info = self.detach_prior_info(lidar_prior_info)
+
+        # 3. 把 LiDAR prior 放进 data，交给 Sparse4D head
+        data["lidar_prior_info"] = lidar_prior_info
+
+        # 第一阶段不要走 DFFA / LiDAR feature fusion
+        # 如果你的 head 里原来会根据 pts_feats 做特征融合，这里先关掉
+        data["pts_feats"] = None
+
+        # 4. Sparse4D image decoder refinement
         model_outs = self.head(feature_maps, data)
-        output = self.head.loss(model_outs, data)
+        sparse4d_loss_dict = self.head.loss(model_outs, data)
+
+        loss_dict.update(sparse4d_loss_dict)
+
+        # 5. depth loss
         if depths is not None and "gt_depth" in data:
-            output["loss_dense_depth"] = self.depth_branch.loss(
+            loss_dict["loss_dense_depth"] = self.depth_branch.loss(
                 depths, data["gt_depth"]
             )
-        return output
+
+        return loss_dict
 
     def forward_test(self, img, **data):
-        points = data.get("points", None)
+        feature_maps = self.extract_feat(img, False, data)
 
-        feature_maps, pts_feats = self.extract_feat(
-            img=img,
-            points=points,
-            return_depth=False,
-            metas=data,
-            img_metas=data.get("img_metas", None),
-        )
 
-        data["pts_feats"] = pts_feats
+        if isinstance(feature_maps, tuple):
+            feature_maps = feature_maps[0]
+
+        lidar_prior_info = None
+
+        if self.use_lidar_prior:
+            points = data.get("points", None)
+            assert points is not None, "use_lidar_prior=True requires points input."
+
+            pts_feats = self.extract_pts_feat(
+                points,
+                img_feats=feature_maps,
+                img_metas=data.get("img_metas", None),
+            )
+
+            lidar_preds = self.lidar_prior_head(pts_feats)
+
+            lidar_prior_info = self.lidar_prior_head.decode_lidar(
+                lidar_preds,
+                feats=pts_feats,
+                metainfo=data,
+            )
+
+        data["lidar_prior_info"] = lidar_prior_info
+        data["pts_feats"] = None
 
         model_outs = self.head(feature_maps, data)
         results = self.head.post_process(model_outs)
         output = [{"img_bbox": result} for result in results]
+
         return output
 
     def simple_test(self, img, **data):
