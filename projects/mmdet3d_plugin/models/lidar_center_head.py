@@ -1,6 +1,7 @@
 from typing import Dict, List, Tuple
 from collections import defaultdict
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch import Tensor, nn
 from torch.cuda.amp import autocast
@@ -36,11 +37,39 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
                  *args,
                  instance_feat_type='cls_embedding',
                  embed_dim=128,
+                 grid_feat_dim=512,
+                 use_score_embedding=False,
+                 velocity_prior_scale=0.0,
                  filter_invisible=False,
                  loss_motion_type=None,
                  loss_frame_offset=None,
+                 zero_lidar_prior_velocity=None,
                  init_cfg=None,
                  **kwargs):
+        """LiDAR CenterPoint head used to generate Sparse4D prior queries.
+
+        This version supports industrial-style prior instance feature generation:
+            - cls_embedding
+            - grid_feat
+            - cls_guide_grid_feat
+            - optional score embedding
+            - optional velocity prior scale
+        """
+        # Backward compatibility:
+        # some configs may still pass zero_lidar_prior_velocity inside kwargs.
+        if zero_lidar_prior_velocity is None:
+            zero_lidar_prior_velocity = kwargs.pop(
+                "zero_lidar_prior_velocity",
+                True,
+            )
+        else:
+            kwargs.pop("zero_lidar_prior_velocity", None)
+
+        self.zero_lidar_prior_velocity = zero_lidar_prior_velocity
+        self.velocity_prior_scale = velocity_prior_scale
+        self.grid_feat_dim = grid_feat_dim
+        self.use_score_embedding = use_score_embedding
+
         super(LidarSparseFusionCenterHead, self).__init__(
             *args,
             init_cfg=init_cfg,
@@ -59,7 +88,6 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
 
         self._init_instance_feat_generator()
 
-        # self.with_motion_loss = self.train_cfg.get('loss_motion', False)
         self.with_motion_loss = False
         self.loss_motion_type = None
         self.loss_frame_offset = None
@@ -77,6 +105,23 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
             self.loss_frame_offset = None
 
     def _init_instance_feat_generator(self):
+        """Initialize prior instance feature generator.
+
+        Industrial-style options:
+            - cls_embedding:
+                instance_feats = cls_embedding(labels)
+
+            - grid_feat:
+                instance_feats = MLP(BEV_feature_at_proposal_center)
+
+            - cls_guide_grid_feat:
+                instance_feats = MLP(
+                    concat(
+                        MLP(BEV_feature_at_proposal_center),
+                        cls_embedding(labels)
+                    )
+                )
+        """
         num_classes = sum(self.num_classes)
         padding_cls_id = num_classes
 
@@ -88,8 +133,8 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
             )
 
         elif self.instance_feat_type == 'grid_feat':
-            self.cls_embedding = nn.Sequential(
-                nn.Linear(self.embed_dim, self.embed_dim),
+            self.grid_feat_proj = nn.Sequential(
+                nn.Linear(self.grid_feat_dim, self.embed_dim),
                 nn.ReLU(inplace=True),
                 nn.LayerNorm(self.embed_dim)
             )
@@ -100,6 +145,11 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
                 self.embed_dim,
                 padding_idx=padding_cls_id
             )
+            self.grid_feat_proj = nn.Sequential(
+                nn.Linear(self.grid_feat_dim, self.embed_dim),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(self.embed_dim)
+            )
             self.cls_guide_fusion = nn.Sequential(
                 nn.Linear(self.embed_dim * 2, self.embed_dim),
                 nn.ReLU(inplace=True),
@@ -109,6 +159,13 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
         else:
             raise NotImplementedError(
                 f'Unknown instance_feat_type: {self.instance_feat_type}'
+            )
+
+        if self.use_score_embedding:
+            self.score_mlp = nn.Sequential(
+                nn.Linear(1, self.embed_dim),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(self.embed_dim)
             )
 
     def filter_anns(self,
@@ -1033,18 +1090,146 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
             ))
 
         return ret_list
-    def boxes_to_anchors(self, boxes):
+
+    def _get_bev_feat_at_centers(self, feats, boxes: Tensor) -> Tensor:
+        """Sample BEV grid features at decoded proposal centers.
+
+        Industrial code can use bbox_coder.decode(..., feat=..., mode='proposal')
+        to return proposal features. The old mmdet3d CenterPointBBoxCoder used
+        here only returns boxes / scores / labels, so this function samples BEV
+        features manually at proposal centers.
+
+        Args:
+            feats:
+                Tensor or list[Tensor]. Expected first BEV feature:
+                [B, C, H, W].
+            boxes:
+                Decoded boxes in metric coordinates:
+                [B, K, 7] or [B, K, 9],
+                [x, y, z, l, w, h, yaw, ...]
+
+        Returns:
+            Tensor: [B, K, C]
+        """
+        if isinstance(feats, (list, tuple)):
+            feat = feats[0]
+        else:
+            feat = feats
+
+        assert feat is not None, \
+            f"{self.instance_feat_type} requires BEV features."
+        assert feat.dim() == 4, \
+            f"Expected BEV feature [B, C, H, W], got {feat.shape}"
+
+        B, C, H, W = feat.shape
+        device = feat.device
+        dtype = feat.dtype
+
+        # Important: do not backprop through CenterPointBBoxCoder.decode().
+        # The official old mmdet3d decode path contains topk / bool masks,
+        # which are not safe for gradient computation.
+        boxes = boxes.detach().to(device=device, dtype=dtype)
+
+        pc_range = feat.new_tensor(self.train_cfg['point_cloud_range'])
+        voxel_size = feat.new_tensor(self.train_cfg['voxel_size'])
+
+        out_size_factor = self.train_cfg['out_size_factor']
+        if isinstance(out_size_factor, (list, tuple)):
+            out_size_factor = out_size_factor[0]
+
+        x = boxes[..., 0]
+        y = boxes[..., 1]
+
+        coor_x = (x - pc_range[0]) / voxel_size[0] / out_size_factor
+        coor_y = (y - pc_range[1]) / voxel_size[1] / out_size_factor
+
+        # grid_sample uses normalized coordinates in [-1, 1].
+        norm_x = coor_x / max(W - 1, 1) * 2.0 - 1.0
+        norm_y = coor_y / max(H - 1, 1) * 2.0 - 1.0
+
+        grid = torch.stack([norm_x, norm_y], dim=-1)  # [B, K, 2]
+        grid = grid.unsqueeze(2)  # [B, K, 1, 2]
+
+        sampled = F.grid_sample(
+            feat,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )  # [B, C, K, 1]
+
+        grid_feats = sampled.squeeze(-1).permute(0, 2, 1).contiguous()
+        return grid_feats
+
+    def _build_prior_instance_feats(
+        self,
+        boxes: Tensor,
+        labels: Tensor,
+        scores: Tensor,
+        feats=None,
+    ) -> Tensor:
+        """Build Sparse4D prior instance features.
+
+        Args:
+            boxes: [B, K, 7/9], decoded metric boxes.
+            labels: [B, K], global class ids with padding id.
+            scores: [B, K].
+            feats: LiDAR BEV features.
+
+        Returns:
+            instance_feats: [B, K, embed_dim]
+        """
+        if self.instance_feat_type == 'cls_embedding':
+            instance_feats = self.cls_embedding(labels)
+
+        elif self.instance_feat_type == 'grid_feat':
+            grid_feats = self._get_bev_feat_at_centers(feats, boxes)
+            instance_feats = self.grid_feat_proj(grid_feats)
+
+        elif self.instance_feat_type == 'cls_guide_grid_feat':
+            grid_feats = self._get_bev_feat_at_centers(feats, boxes)
+            grid_feats = self.grid_feat_proj(grid_feats)
+
+            cls_feats = self.cls_embedding(labels)
+            instance_feats = self.cls_guide_fusion(
+                torch.cat([grid_feats, cls_feats], dim=-1)
+            )
+
+        else:
+            raise NotImplementedError(
+                f'Unknown instance_feat_type: {self.instance_feat_type}'
+            )
+
+        if self.use_score_embedding:
+            # Detach scores from bbox_coder.decode(); only train score_mlp params.
+            score_feats = self.score_mlp(
+                scores.detach().unsqueeze(-1).to(instance_feats.dtype)
+            )
+            instance_feats = instance_feats + score_feats
+
+        instance_feats = torch.nan_to_num(
+            instance_feats,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        return instance_feats
+
+    def boxes_to_anchors(self, boxes: Tensor) -> Tensor:
         """Convert CenterPoint decoded boxes to Sparse4D-style anchors.
 
         Args:
-            boxes (Tensor): Shape [B, K, C] or [K, C].
-                Expected format:
+            boxes:
+                [B, K, 7] or [B, K, 9]
                 [x, y, z, l, w, h, yaw] or
                 [x, y, z, l, w, h, yaw, vx, vy]
 
         Returns:
-            Tensor: Sparse4D-style anchors.
-                [x, y, z, l, w, h, sin_yaw, cos_yaw, vx, vy]
+            anchors:
+                [B, K, 10]
+                [x, y, z, log(l), log(w), log(h),
+                 sin_yaw, cos_yaw, vx, vy]
         """
         squeeze_batch = False
         if boxes.dim() == 2:
@@ -1054,13 +1239,18 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
         x = boxes[..., 0]
         y = boxes[..., 1]
         z = boxes[..., 2]
-        l = boxes[..., 3]
-        w = boxes[..., 4]
-        h = boxes[..., 5]
-        yaw = boxes[..., 6]
 
+        l = boxes[..., 3].clamp(min=1e-3, max=50.0)
+        w = boxes[..., 4].clamp(min=1e-3, max=50.0)
+        h = boxes[..., 5].clamp(min=1e-3, max=20.0)
+
+        yaw = boxes[..., 6]
         sin_yaw = torch.sin(yaw)
         cos_yaw = torch.cos(yaw)
+
+        log_l = torch.log(l)
+        log_w = torch.log(w)
+        log_h = torch.log(h)
 
         if boxes.shape[-1] >= 9:
             vx = boxes[..., 7]
@@ -1069,57 +1259,64 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
             vx = torch.zeros_like(x)
             vy = torch.zeros_like(y)
 
+        if getattr(self, "zero_lidar_prior_velocity", True):
+            vx = torch.zeros_like(vx)
+            vy = torch.zeros_like(vy)
+        else:
+            scale = getattr(self, "velocity_prior_scale", 1.0)
+            vx = vx * scale
+            vy = vy * scale
+
         anchors = torch.stack(
-            [x, y, z, l, w, h, sin_yaw, cos_yaw, vx, vy],
+            [x, y, z, log_l, log_w, log_h, sin_yaw, cos_yaw, vx, vy],
             dim=-1
+        )
+
+        anchors = torch.nan_to_num(
+            anchors,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
         )
 
         if squeeze_batch:
             anchors = anchors.squeeze(0)
 
-        return anchors        
-    def _pad_or_truncate_priors(self, boxes, scores, labels, max_num):
-        """Pad or truncate proposals to fixed number.
+        return anchors
 
-        Args:
-            boxes (Tensor): [N, C]
-            scores (Tensor): [N]
-            labels (Tensor): [N]
-            max_num (int): Fixed number of proposals.
-
-        Returns:
-            tuple:
-                boxes_out: [max_num, C]
-                scores_out: [max_num]
-                labels_out: [max_num]
-        """
+    def _pad_or_truncate_priors(
+        self,
+        boxes: Tensor,
+        scores: Tensor,
+        labels: Tensor,
+        max_num: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Sort proposals by score and pad/truncate to fixed length."""
         device = boxes.device
         dtype = boxes.dtype
         box_dim = boxes.shape[-1]
+        padding_cls_id = sum(self.num_classes)
 
-        if boxes.shape[0] > 0:
-            order = scores.sort(descending=True)[1]
-            order = order[:max_num]
-
+        if boxes.numel() > 0 and boxes.shape[0] > 0:
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+            order = scores.sort(descending=True)[1][:max_num]
             boxes = boxes[order]
             scores = scores[order]
             labels = labels[order].long()
         else:
             boxes = boxes.new_zeros((0, box_dim))
-            scores = scores.new_zeros((0,))
-            labels = labels.new_zeros((0,), dtype=torch.long)
+            scores = boxes.new_zeros((0,), dtype=dtype)
+            labels = boxes.new_zeros((0,), dtype=torch.long)
 
         num = boxes.shape[0]
 
         boxes_out = boxes.new_zeros((max_num, box_dim))
         scores_out = scores.new_zeros((max_num,))
-
-        # padding label 使用 num_classes，正好对应 cls_embedding 的 padding_idx
-        padding_cls_id = sum(self.num_classes)
         labels_out = labels.new_full(
             (max_num,),
             fill_value=padding_cls_id,
-            dtype=torch.long
+            dtype=torch.long,
+            device=device,
         )
 
         if num > 0:
@@ -1129,55 +1326,51 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
 
         return boxes_out, scores_out, labels_out
 
-    def decode_lidar(self,
-                    preds_dicts: List[Dict[str, Tensor]],
-                    feats: List[Tensor] = None,
-                    metainfo: Dict[str, Tensor] = None):
-        """Decode LiDAR branch predictions into Sparse4D-style priors.
 
-        This function uses official CenterPointBBoxCoder.decode() and then
-        converts decoded boxes into Sparse4D prior anchors and instance features.
+    def decode_lidar(
+        self,
+        preds_dicts: List[Dict[str, Tensor]],
+        feats: List[Tensor] = None,
+        metainfo: Dict[str, Tensor] = None,
+    ):
+        """Decode LiDAR CenterHead predictions into Sparse4D priors.
+
+        This adapts industrial cls_guide_grid_feat design to the old mmdet3d
+        CenterPointBBoxCoder, which only returns boxes / scores / labels.
 
         Returns:
             dict:
-                anchors: [B, N, 10]
-                instance_feats: [B, N, embed_dim]
-                scores: [B, N]
-                labels: [B, N]
+                anchors: [B, K, 10]
+                instance_feats: [B, K, embed_dim]
+                scores: [B, K]
+                labels: [B, K]
+                valid_mask: [B, K]
+                raw_boxes: [B, K, 7/9]
         """
         multi_task_boxes = []
         multi_task_scores = []
         multi_task_labels = []
 
-        proposal_nums = self.test_cfg.get('proposal_nums', None)
-        default_topk = self.test_cfg.get('post_max_size', 300)
+        proposal_nums = self.test_cfg.get("proposal_nums", None)
+        default_topk = self.test_cfg.get("post_max_size", 150)
 
         for task_id, preds_dict in enumerate(preds_dicts):
-            batch_heatmap = preds_dict['heatmap'].sigmoid()
+            batch_heatmap = preds_dict["heatmap"].sigmoid()
 
-            if self.test_cfg.get('nms_type', None) == 'local_maximum_heatmap':
+            if self.test_cfg.get("nms_type", None) == "local_maximum_heatmap":
                 batch_heatmap = get_local_maximum(batch_heatmap)
 
-            batch_reg = preds_dict['reg']
-            batch_hei = preds_dict['height']
+            batch_reg = preds_dict["reg"]
+            batch_hei = preds_dict["height"]
+            batch_dim = preds_dict["dim"]
+            batch_rots = preds_dict["rot"][:, 0:1]
+            batch_rotc = preds_dict["rot"][:, 1:2]
 
-            if self.norm_bbox:
-                batch_dim = torch.exp(preds_dict['dim'])
+            if "vel" in preds_dict:
+                batch_vel = preds_dict["vel"]
             else:
-                batch_dim = preds_dict['dim']
+                batch_vel = torch.zeros_like(preds_dict["rot"])
 
-            batch_rots = preds_dict['rot'][:, 0:1]
-            batch_rotc = preds_dict['rot'][:, 1:2]
-
-            if 'vel' in preds_dict:
-                batch_vel = preds_dict['vel']
-            else:
-                batch_vel = torch.zeros_like(preds_dict['rot'])
-
-            # -----------------------------------------------------
-            # Use official CenterPointBBoxCoder interface.
-            # Do NOT pass feat=... or mode='proposal'.
-            # -----------------------------------------------------
             temp = self.bbox_coder.decode(
                 batch_heatmap,
                 batch_rots,
@@ -1186,30 +1379,33 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
                 batch_dim,
                 batch_vel,
                 reg=batch_reg,
-                task_id=task_id
+                task_id=task_id,
             )
 
             if proposal_nums is not None:
-                task_topk = proposal_nums[task_id]
+                if isinstance(proposal_nums, int):
+                    task_topk = proposal_nums
+                else:
+                    task_topk = proposal_nums[task_id]
             else:
                 task_topk = default_topk
+
+            label_offset = sum(self.num_classes[:task_id])
 
             batch_boxes = []
             batch_scores = []
             batch_labels = []
 
-            label_offset = sum(self.num_classes[:task_id])
-
             for sample_ret in temp:
-                boxes = sample_ret['bboxes']
-                scores = sample_ret['scores']
-                labels = sample_ret['labels'].long() + label_offset
+                boxes = sample_ret["bboxes"]
+                scores = sample_ret["scores"]
+                labels = sample_ret["labels"].long() + label_offset
 
                 boxes, scores, labels = self._pad_or_truncate_priors(
                     boxes,
                     scores,
                     labels,
-                    task_topk
+                    task_topk,
                 )
 
                 batch_boxes.append(boxes)
@@ -1218,64 +1414,44 @@ class LidarSparseFusionCenterHead(SparseFusionCenterHead):
 
             batch_boxes = torch.stack(batch_boxes, dim=0)
             batch_scores = torch.stack(batch_scores, dim=0)
-            batch_labels = torch.stack(batch_labels, dim=0)
+            batch_labels = torch.stack(batch_labels, dim=0).long()
 
             multi_task_boxes.append(batch_boxes)
             multi_task_scores.append(batch_scores)
             multi_task_labels.append(batch_labels)
 
-        # [B, N, C]
         boxes = torch.cat(multi_task_boxes, dim=1)
-
-        # [B, N]
         scores = torch.cat(multi_task_scores, dim=1)
         labels = torch.cat(multi_task_labels, dim=1).long()
 
-        # ---------------------------------------------------------
-        # Convert decoded boxes to Sparse4D-style anchors:
-        # [x, y, z, l, w, h, sin_yaw, cos_yaw, vx, vy]
-        # ---------------------------------------------------------
         anchors = self.boxes_to_anchors(boxes)
 
-        # ---------------------------------------------------------
-        # Generate instance features.
-        # First version: cls_embedding only.
-        # ---------------------------------------------------------
-        if self.instance_feat_type == 'cls_embedding':
-            instance_feats = self.cls_embedding(labels)
+        instance_feats = self._build_prior_instance_feats(
+            boxes=boxes,
+            labels=labels,
+            scores=scores,
+            feats=feats,
+        )
 
-        elif self.instance_feat_type == 'grid_feat':
-            raise NotImplementedError(
-                'grid_feat requires BEV feature gathering by proposal centers. '
-                'Do this after cls_embedding prior path is verified.'
-            )
+        # Non-feature fields should not keep graph from bbox_coder.decode().
+        # instance_feats keeps graph for cls/grid/score feature generator,
+        # but anchors/scores/labels/raw_boxes/valid_mask are only metadata.
+        scores_detached = scores.detach().clone()
+        labels_detached = labels.detach().clone()
+        boxes_detached = boxes.detach().clone()
+        anchors_detached = anchors.detach().clone()
 
-        elif self.instance_feat_type == 'cls_guide_grid_feat':
-            raise NotImplementedError(
-                'cls_guide_grid_feat requires BEV feature gathering by proposal centers. '
-                'Do this after cls_embedding prior path is verified.'
-            )
-
-        else:
-            raise NotImplementedError(
-                f'Unknown instance_feat_type: {self.instance_feat_type}'
-            )
-
-        # ---------------------------------------------------------
-        # Detach LiDAR prior in the first stage.
-        # Sparse4D loss should not back-propagate to LiDAR head yet.
-        # ---------------------------------------------------------
-        if self.training:
-            anchors = anchors.detach()
-            instance_feats = instance_feats.detach()
-            scores = scores.detach()
-            labels = labels.detach()
+        score_thr = self.test_cfg.get("score_threshold", 0.0)
+        valid_mask = (scores_detached > score_thr).clone().detach()
 
         instances = dict(
-            anchors=anchors,
+            anchors=anchors_detached,
             instance_feats=instance_feats,
-            scores=scores,
-            labels=labels
+            scores=scores_detached,
+            labels=labels_detached,
+            valid_mask=valid_mask,
+            raw_boxes=boxes_detached,
         )
 
         return instances
+

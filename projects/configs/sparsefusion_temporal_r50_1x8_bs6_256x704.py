@@ -76,24 +76,15 @@ num_iters_per_epoch = int(28130 // (num_gpus * batch_size))
 num_epochs = 100
 checkpoint_epoch_interval = 20
 
-checkpoint_config = dict(
-    interval=num_iters_per_epoch * checkpoint_epoch_interval
-)
-log_config = dict(
-    interval=100,
-    hooks=[
-        dict(type="TextLoggerHook", by_epoch=False),
-        dict(type="TensorboardLoggerHook"),
-    ],
-)
+
 # log_config = dict(
 #     interval=50,
 #     hooks=[
 #         dict(type="TextLoggerHook"),
 #     ],
 # )
-load_from = None
 resume_from = None
+load_from = None
 workflow = [("train", 1)]
 import sys
 
@@ -202,11 +193,21 @@ model = dict(
         norm_cfg=dict(type='BN', eps=0.001, momentum=0.01),
         upsample_cfg=dict(type='deconv', bias=False),
         use_conv_for_no_stride=True),
+    # lidar center head
     use_lidar_prior=True,
     detach_lidar_prior=True,
     lidar_prior_loss_weight=1.0,
+    lidar_prior_warmup_iters=0,
+
     lidar_prior_head=dict(
         type="LidarSparseFusionCenterHead",
+        instance_feat_type="cls_guide_grid_feat",
+        embed_dim=embed_dims,
+        grid_feat_dim=512,
+        use_score_embedding=True,
+        filter_invisible=False,
+        zero_lidar_prior_velocity=True,
+        velocity_prior_scale=0.0,
         in_channels=512,
         tasks=[
             dict(
@@ -249,9 +250,6 @@ model = dict(
         num_heatmap_convs=2,
         norm_bbox=True,
 
-        instance_feat_type="cls_embedding",
-        embed_dim=embed_dims,
-        filter_invisible=False,
 
         loss_cls=dict(type="GaussianFocalLoss", reduction="mean"),
         loss_bbox=dict(type="L1Loss", reduction="mean", loss_weight=0.25),
@@ -275,8 +273,8 @@ model = dict(
         test_cfg=dict(
             nms_type='circle',
             min_radius=[4],
-            post_max_size=300,
-            proposal_nums=[300],
+            post_max_size=150,
+            proposal_nums=[150],
             score_threshold=0.05,
         ),
     ),
@@ -285,6 +283,10 @@ model = dict(
         cls_threshold_to_reg=0.05,
         decouple_attn=decouple_attn,
         use_pts_feat=False,
+        lidar_prior_score_thr=0.01,
+        lidar_prior_feat_scale=0.2,
+        cache_lidar_prior=False,
+        output_lidar_prior=False,
         pts_in_channels=512,
         pts_out_channels=256,
         instance_bank=dict(
@@ -454,7 +456,7 @@ train_pipeline = [
     ),
     dict(
         type='LoadPointsFromMultiSweeps',
-        sweeps_num=5,
+        sweeps_num=10,
         use_dim=[0, 1, 2, 3, 4],
         file_client_args=file_client_args,
     ),
@@ -610,14 +612,14 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-# runner = dict(
-#     type="IterBasedRunner",
-#     max_iters=num_iters_per_epoch * num_epochs,
-# )
 runner = dict(
     type="IterBasedRunner",
-    max_iters=3000
+    max_iters=num_iters_per_epoch * num_epochs,
 )
+# runner = dict(
+#     type="IterBasedRunner",
+#     max_iters=3000
+# )
 
 # ================== eval ========================
 vis_pipeline = [
@@ -628,14 +630,24 @@ vis_pipeline = [
         meta_keys=["timestamp", "lidar2img"],
     ),
 ]
-# evaluation = dict(
-#     interval=num_iters_per_epoch * checkpoint_epoch_interval,
-#     pipeline=vis_pipeline,
-#     # out_dir="./vis",  # for visualization
-# )
 evaluation = dict(
-    interval=3000,
-    pipeline=test_pipeline,
-#     # out_dir="./vis",  # for visualization
+    interval=num_iters_per_epoch * checkpoint_epoch_interval,
+    pipeline=vis_pipeline,
+    # out_dir="./vis",  # for visualization
 )
-checkpoint_config = dict(interval=1000)
+# evaluation = dict(
+#     interval=3000,
+#     pipeline=test_pipeline,
+# #     # out_dir="./vis",  # for visualization
+# )
+# checkpoint_config = dict(interval=5000)
+checkpoint_config = dict(
+    interval=num_iters_per_epoch * checkpoint_epoch_interval
+)
+log_config = dict(
+    interval=100,
+    hooks=[
+        dict(type="TextLoggerHook", by_epoch=False),
+        dict(type="TensorboardLoggerHook"),
+    ],
+)
