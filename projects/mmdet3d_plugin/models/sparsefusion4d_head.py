@@ -2,6 +2,7 @@
 from typing import List, Optional, Tuple, Union
 from collections import defaultdict
 import warnings
+import copy
 
 import numpy as np
 import torch
@@ -121,6 +122,36 @@ class SparseFusion4DHead(BaseModule):
         )
         self.embed_dims = self.instance_bank.embed_dims
 
+        # ---------------------------------------------------------
+        # Industrial-style pre-decoder path.
+        # No extra config switch. If LiDAR prior exists, it is first
+        # used as temp memory to update LAQ before the main decoder.
+        # This reuses existing Sparse4D temp_gnn + norm modules.
+        # ---------------------------------------------------------
+        self.pre_layer = None
+        self.pre_norm = None
+
+        temp_idx = None
+        for _op_name in ["temp_gnn", "temp_cross_attn", "temporal_cross_attn"]:
+            if _op_name in self.operation_order:
+                _idx = self.operation_order.index(_op_name)
+                if self.layers[_idx] is not None:
+                    temp_idx = _idx
+                    break
+
+        if temp_idx is not None:
+            norm_idx = None
+            for _j in range(temp_idx + 1, len(self.operation_order)):
+                if self.operation_order[_j] == "norm" and self.layers[_j] is not None:
+                    norm_idx = _j
+                    break
+
+            self.pre_layer = nn.ModuleList([copy.deepcopy(self.layers[temp_idx])])
+            if norm_idx is not None:
+                self.pre_norm = nn.ModuleList([copy.deepcopy(self.layers[norm_idx])])
+            else:
+                self.pre_norm = nn.ModuleList([nn.LayerNorm(self.embed_dims)])
+
         self.use_pts_feat = use_pts_feat
         self.use_lidar_prior_query = use_lidar_prior_query
         self.lidar_prior_score_thr = lidar_prior_score_thr
@@ -136,7 +167,7 @@ class SparseFusion4DHead(BaseModule):
                 kernel_size=1,
                 bias=False,
             )
-            
+
         if self.decouple_attn:
             self.fc_before = nn.Linear(
                 self.embed_dims, self.embed_dims * 2, bias=False
@@ -160,318 +191,139 @@ class SparseFusion4DHead(BaseModule):
             if hasattr(m, "init_weight"):
                 m.init_weight()
 
-    def prepare_instance_info(
+    def _align_prior_anchor_dim(self, prior_anchor, target_dim):
+        if prior_anchor is None:
+            return None
+
+        if prior_anchor.shape[-1] < target_dim:
+            pad = prior_anchor.new_zeros(
+                *prior_anchor.shape[:-1],
+                target_dim - prior_anchor.shape[-1],
+            )
+            prior_anchor = torch.cat([prior_anchor, pad], dim=-1)
+        elif prior_anchor.shape[-1] > target_dim:
+            prior_anchor = prior_anchor[..., :target_dim]
+
+        return prior_anchor
+
+
+    def _call_pre_temp_attn(
         self,
-        laq_info: dict = None,
-        prior_info: dict = None,
-        prop_info: dict = None,
-    ) -> dict:
-        """Prepare instance queries in industrial-style order.
+        temp_attn,
+        query_feature,
+        query_anchor,
+        query_anchor_embed,
+        temp_feature,
+        temp_anchor,
+        temp_anchor_embed,
+    ):
+        """Reuse current Sparse4D temp attention exactly like graph_model().
 
-        Query order:
-            [LAQ, prior, prop]
-
-        Important:
-            Bool masks are NOT used in the differentiable feature path.
-            They are only stored for bookkeeping. This avoids PyTorch
-            inplace-version errors on CUDABoolTensor during backward.
+        This is the Sparse4D v3 adaptation of the industrial pre_decoder:
+        query = LAQ, key/value = LiDAR prior memory.
+        No newly-designed attention module is introduced here.
         """
-        if laq_info is None:
-            laq_info = dict()
-        if prior_info is None:
-            prior_info = dict()
-        if prop_info is None:
-            prop_info = dict()
+        query = query_feature
+        key = temp_feature
+        value = temp_feature
+        query_pos = query_anchor_embed
+        key_pos = temp_anchor_embed
 
-        assert any(len(info) > 0 for info in [laq_info, prior_info, prop_info])
+        if self.decouple_attn:
+            query = torch.cat([query, query_pos], dim=-1)
+            key = torch.cat([key, key_pos], dim=-1)
+            query_pos, key_pos = None, None
 
-        query_anchors = []
-        query_feats = []
-        valid_masks = []
-        query_sources = []
+        if value is not None:
+            value = self.fc_before(value)
 
-        num_laq = 0
-        num_prior = 0
-        num_prop = 0
-        num_cam_prior = 0
-        num_lidar_prior = 0
+        out = temp_attn(
+            query,
+            key,
+            value,
+            query_pos=query_pos,
+            key_pos=key_pos,
+            attn_mask=None,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
 
-        # ---------------------------------------------------------
-        # 1. LAQ first
-        # ---------------------------------------------------------
-        if len(laq_info) > 0:
-            laq_anchor = laq_info["anchors"]
-            laq_feature = laq_info["instance_feats"]
+        return self.fc_after(out)
 
-            query_anchors.append(laq_anchor)
-            query_feats.append(laq_feature)
 
-            bs, num_laq = laq_anchor.shape[:2]
+    def forward_pre_decoder(
+        self,
+        laq_anchor,
+        laq_instance_feature,
+        instance_info,
+    ):
+        """
+        Industrial-style prior preprocessing.
 
-            laq_valid_mask = torch.ones(
-                (bs, num_laq),
-                dtype=torch.bool,
-                device=laq_anchor.device,
-            )
-            laq_query_source = torch.zeros(
-                (bs, num_laq),
-                dtype=torch.long,
-                device=laq_anchor.device,
-            )
+        Equivalent semantic from industrial Spares3DHead.forward_pre_decoder:
 
-            valid_masks.append(laq_valid_mask)
-            query_sources.append(laq_query_source)
+            pre_info = prepare_instance_info(laq_info, prop_info)
+            pre_info['temp_anchors'] = instance_info['prior_anchors']
+            pre_info['temp_instance_feats'] = instance_info['prior_instance_feats']
+            pre_info['temp_attn_mask'] = None
 
-        assert len(query_anchors) > 0, \
-            "Current Sparse4D adaptation requires LAQ / bank queries."
+        In current Sparse4D v3 adaptation:
+            query = LAQ
+            temp memory = LiDAR prior
+            output = updated LAQ
+        """
 
-        ref_anchor = query_anchors[0]
-        ref_feature = query_feats[0]
+        if instance_info is None:
+            return laq_anchor, laq_instance_feature
 
-        # ---------------------------------------------------------
-        # 2. Prior second
-        # ---------------------------------------------------------
-        if len(prior_info) > 0:
-            prior_anchor = prior_info["prior_anchors"]
-            prior_feature = prior_info["prior_instance_feats"]
-            prior_scores = prior_info.get("prior_scores", None)
-            prior_valid_mask = prior_info.get("prior_valid_mask", None)
+        if self.pre_layer is None or len(self.pre_layer) == 0:
+            return laq_anchor, laq_instance_feature
 
-            prior_anchor = prior_anchor.to(
-                device=ref_anchor.device,
-                dtype=ref_anchor.dtype,
-            )
-            prior_feature = prior_feature.to(
-                device=ref_feature.device,
-                dtype=ref_feature.dtype,
-            )
+        if "prior_anchors" not in instance_info:
+            return laq_anchor, laq_instance_feature
 
-            anchor_dim = ref_anchor.shape[-1]
-            feat_dim = ref_feature.shape[-1]
+        if "prior_instance_feats" not in instance_info:
+            return laq_anchor, laq_instance_feature
 
-            if prior_anchor.shape[-1] < anchor_dim:
-                pad_shape = list(prior_anchor.shape)
-                pad_shape[-1] = anchor_dim - prior_anchor.shape[-1]
-                prior_anchor = torch.cat(
-                    [prior_anchor, prior_anchor.new_zeros(*pad_shape)],
-                    dim=-1,
-                )
-            elif prior_anchor.shape[-1] > anchor_dim:
-                prior_anchor = prior_anchor[..., :anchor_dim]
+        prior_anchor = instance_info["prior_anchors"]
+        prior_feature = instance_info["prior_instance_feats"]
 
-            if prior_feature.shape[-1] != feat_dim:
-                raise RuntimeError(
-                    f"prior feature dim {prior_feature.shape[-1]} != "
-                    f"LAQ feature dim {feat_dim}"
-                )
+        if prior_anchor is None or prior_feature is None:
+            return laq_anchor, laq_instance_feature
 
-            prior_anchor = torch.nan_to_num(
-                prior_anchor,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            prior_feature = torch.nan_to_num(
-                prior_feature,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
+        if prior_anchor.shape[1] == 0:
+            return laq_anchor, laq_instance_feature
 
-            bs, num_prior = prior_anchor.shape[:2]
-
-            # -----------------------------------------------------
-            # Bool mask only for bookkeeping, NOT for feature graph.
-            # -----------------------------------------------------
-            if prior_valid_mask is not None:
-                prior_valid_mask = prior_valid_mask.to(
-                    device=prior_anchor.device,
-                    dtype=torch.bool,
-                ).clone().detach()
-            elif prior_scores is not None:
-                prior_scores_detached = prior_scores.detach().to(
-                    device=prior_anchor.device
-                )
-                prior_scores_detached = torch.nan_to_num(
-                    prior_scores_detached,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-                prior_valid_mask = (
-                    prior_scores_detached > self.lidar_prior_score_thr
-                ).clone().detach()
-            else:
-                prior_scores_detached = None
-                prior_valid_mask = torch.ones(
-                    (bs, num_prior),
-                    dtype=torch.bool,
-                    device=prior_anchor.device,
-                )
-
-            # -----------------------------------------------------
-            # Use detached FLOAT score weight instead of Bool mask.
-            # This prevents CUDABoolTensor inplace-version errors.
-            # Padded proposals usually have score 0, so this also
-            # suppresses padded prior tokens.
-            # -----------------------------------------------------
-            if prior_scores is not None:
-                score_weight = prior_scores.detach().to(
-                    device=prior_feature.device,
-                    dtype=prior_feature.dtype,
-                )
-                score_weight = torch.nan_to_num(
-                    score_weight,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ).clamp(min=0.0, max=1.0)
-                prior_feature = prior_feature * score_weight.unsqueeze(-1)
-
-            # -----------------------------------------------------
-            # Dynamic prior feature scale.
-            # -----------------------------------------------------
-            scale = self.lidar_prior_feat_scale
-
-            cur_iter = getattr(self, "_cur_iter", None)
-            if cur_iter is not None:
-                try:
-                    cur_iter_int = int(cur_iter)
-                except Exception:
-                    cur_iter_int = None
-
-                if cur_iter_int is not None:
-                    ramp_start = getattr(self, "lidar_prior_ramp_start", 0)
-                    ramp_end = getattr(self, "lidar_prior_ramp_end", 1000)
-
-                    if cur_iter_int < ramp_start:
-                        scale = 0.0
-                    elif cur_iter_int < ramp_end:
-                        ratio = float(cur_iter_int - ramp_start) / float(
-                            max(ramp_end - ramp_start, 1)
-                        )
-                        scale = scale * ratio
-
-            prior_feature = prior_feature * scale
-
-            prior_query_source = torch.ones(
-                (bs, num_prior),
-                dtype=torch.long,
-                device=prior_anchor.device,
-            )
-
-            query_anchors.append(prior_anchor)
-            query_feats.append(prior_feature)
-            valid_masks.append(prior_valid_mask)
-            query_sources.append(prior_query_source)
-
-            num_cam_prior = prior_info.get("num_cam_prior", 0)
-            num_lidar_prior = prior_info.get("num_lidar_prior", 0)
-
-        # ---------------------------------------------------------
-        # 3. Prop last
-        # ---------------------------------------------------------
-        if len(prop_info) > 0:
-            prop_anchor = prop_info["anchors"].to(
-                device=ref_anchor.device,
-                dtype=ref_anchor.dtype,
-            )
-            prop_feature = prop_info["instance_feats"].to(
-                device=ref_feature.device,
-                dtype=ref_feature.dtype,
-            )
-
-            query_anchors.append(prop_anchor)
-            query_feats.append(prop_feature)
-
-            bs, num_prop = prop_anchor.shape[:2]
-
-            if "confidences" in prop_info:
-                prop_conf = prop_info["confidences"].detach().to(
-                    device=prop_anchor.device,
-                    dtype=prop_anchor.dtype,
-                )
-                prop_valid_mask = (prop_conf > 0.0).clone().detach()
-            else:
-                prop_conf = None
-                prop_valid_mask = torch.ones(
-                    (bs, num_prop),
-                    dtype=torch.bool,
-                    device=prop_anchor.device,
-                )
-
-            prop_query_source = prop_anchor.new_full(
-                (bs, num_prop),
-                fill_value=2,
-                dtype=torch.long,
-            )
-
-            valid_masks.append(prop_valid_mask)
-            query_sources.append(prop_query_source)
-
-        # ---------------------------------------------------------
-        # 4. Concatenate
-        # ---------------------------------------------------------
-        anchors = torch.cat(query_anchors, dim=1)
-        instance_feats = torch.cat(query_feats, dim=1)
-
-        bs, num_anchors = anchors.shape[:2]
-
-        # Clone after cat. Do not modify this tensor in-place later.
-        valid_mask = torch.cat(valid_masks, dim=1).clone().detach()
-        query_source = torch.cat(query_sources, dim=1)
-
-        query_info = dict(
-            anchors=anchors,
-            instance_feats=instance_feats,
-            num_anchors=num_anchors,
-            num_laq=num_laq,
-            num_prior=num_prior,
-            num_prop=num_prop,
-            num_cam_prior=num_cam_prior,
-            num_lidar_prior=num_lidar_prior,
-            valid_mask=valid_mask,
-            query_source=query_source,
+        prior_anchor = self._align_prior_anchor_dim(
+            prior_anchor,
+            laq_anchor.shape[-1],
         )
 
-        # ---------------------------------------------------------
-        # 5. Prop attention mask.
-        # No in-place bool indexing.
-        # ---------------------------------------------------------
-        if len(prop_info) > 0 and "confidences" in prop_info:
-            prop_conf = prop_info["confidences"].detach().to(
-                device=anchors.device,
-                dtype=anchors.dtype,
-            )
-            prop_valid = (prop_conf > 0.0).clone().detach()
+        prior_feature = torch.nan_to_num(
+            prior_feature,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
-            prop_attn_values = torch.where(
-                prop_valid,
-                torch.zeros_like(prop_conf),
-                prop_conf - 1.0,
-            )
+        query_anchor_embed = self.anchor_encoder(laq_anchor)
+        temp_anchor_embed = self.anchor_encoder(prior_anchor)
 
-            prop_attn_mask = prop_attn_values.unsqueeze(1).expand(
-                -1,
-                num_anchors,
-                -1,
-            )
+        query_feature = laq_instance_feature
 
-            prefix_zeros = anchors.new_zeros(
-                (bs, num_anchors, num_anchors - num_prop)
+        for temp_attn, temp_norm in zip(self.pre_layer, self.pre_norm):
+            query_feature = self._call_pre_temp_attn(
+                temp_attn=temp_attn,
+                query_feature=query_feature,
+                query_anchor=laq_anchor,
+                query_anchor_embed=query_anchor_embed,
+                temp_feature=prior_feature,
+                temp_anchor=prior_anchor,
+                temp_anchor_embed=temp_anchor_embed,
             )
-            query_info["attn_mask"] = torch.cat(
-                [prefix_zeros, prop_attn_mask],
-                dim=-1,
-            )
+            query_feature = temp_norm(query_feature)
 
-            # Rebuild instead of in-place assignment.
-            query_info["valid_mask"] = torch.cat(
-                [valid_mask[:, :num_anchors - num_prop], prop_valid],
-                dim=1,
-            ).clone().detach()
-
-        return query_info
+        return laq_anchor, query_feature
 
     def merge_lidar_prior_query(
         self,
@@ -574,7 +426,7 @@ class SparseFusion4DHead(BaseModule):
         prior_feature = prior_feature * prior_valid_mask.unsqueeze(-1).to(
             prior_feature.dtype
         )
-        prior_feature = prior_feature * self.lidar_prior_feat_scale
+        # prior_feature = prior_feature * self.lidar_prior_feat_scale
 
         prior_query_source = torch.ones(
             (B, N_prior),
@@ -594,6 +446,7 @@ class SparseFusion4DHead(BaseModule):
             valid_mask,
             query_source,
         )
+
 
 
     def graph_model(
@@ -671,20 +524,30 @@ class SparseFusion4DHead(BaseModule):
             dn_metas=self.sampler.dn_metas,
         )
 
+        # =========================================================
+        # 2. Industrial-style LiDAR prior preprocessing.
+        #    Prior is NOT concatenated into the main decoder as an
+        #    ordinary query. It is first used as temp memory to update
+        #    LAQ, following the industrial forward_pre_decoder design.
+        # =========================================================
+        detector_instance_info = metas.get("instance_info", None)
+
+        laq_anchor, laq_instance_feature = self.forward_pre_decoder(
+            laq_anchor=laq_anchor,
+            laq_instance_feature=laq_instance_feature,
+            instance_info=detector_instance_info,
+        )
+
         laq_info = dict(
             anchors=laq_anchor,
             instance_feats=laq_instance_feature,
         )
 
-        # =========================================================
-        # 2. Industrial-style query preparation.
-        #    Query order is strictly: [LAQ, prior, prop].
-        #    Prior comes from detector-level data["instance_info"].
-        #    Do NOT call merge_lidar_prior_query() here again.
-        # =========================================================
+        # Main decoder receives LAQ only at this stage.
+        # Do not pass LiDAR prior into prepare_instance_info here.
         query_info = self.prepare_instance_info(
             laq_info=laq_info,
-            prior_info=metas.get("instance_info", None),
+            prior_info=None,
             prop_info=None,
         )
 

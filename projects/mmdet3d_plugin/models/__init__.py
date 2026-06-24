@@ -4,7 +4,7 @@ from .sparsefusion4d import SparseFusion4D
 from .sparsefusion4d_head import SparseFusion4DHead
 from .blocks import (
     DeformableFeatureAggregation,
-    DeformableFeatureFusionAggregation,
+    # DeformableFeatureFusionAggregation,
     DenseDepthNet,
     AsymmetricFFN,
 )
@@ -21,7 +21,7 @@ from .detection3d import (
     SparseBox3DKeyPointsGenerator,
     SparseBox3DEncoder,
 )
-
+from .deformable_feature_aggregation import DeformableFeatureFusionAggregation
 
 __all__ = [
     "Sparse4D",
