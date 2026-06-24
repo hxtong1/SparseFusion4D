@@ -17,16 +17,25 @@ from os import path as osp
 
 from mmdet import __version__ as mmdet_version
 from mmdet.apis import train_detector
-from mmdet.datasets import build_dataset
-from mmdet.models import build_detector
+# from mmdet.datasets import build_dataset
+# from mmdet.models import build_detector
+from mmdet3d.datasets import build_dataset
+from mmdet3d.models import build_detector
 from mmdet.utils import collect_env, get_root_logger
 from mmdet.apis import set_random_seed
+import mmdet3d.datasets.pipelines
+import projects.mmdet3d_plugin
+import projects.mmdet3d_plugin.datasets
+import projects.mmdet3d_plugin.datasets.pipelines
+
 from torch import distributed as dist
 from datetime import timedelta
 
 import cv2
 
 cv2.setNumThreads(8)
+
+
 
 
 def parse_args():

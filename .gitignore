@@ -17,3 +17,4 @@ __pycache__/
 *.pkl
 work_dirs/
 outputs/
+results_vis/

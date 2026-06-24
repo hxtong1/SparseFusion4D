@@ -16,8 +16,10 @@ from nuscenes.eval.common.config import config_factory as track_configs
 
 import mmcv
 from mmcv.utils import print_log
-from mmdet.datasets import DATASETS
-from mmdet.datasets.pipelines import Compose
+# from mmdet.datasets import DATASETS
+# from mmdet.datasets.pipelines import Compose
+from .builder import DATASETS
+from mmdet3d.datasets.pipelines import Compose
 from .utils import (
     draw_lidar_bbox3d_on_img,
     draw_lidar_bbox3d_on_bev,

@@ -195,9 +195,7 @@ model = dict(
         use_conv_for_no_stride=True),
     # lidar center head
     use_lidar_prior=True,
-    detach_lidar_prior=True,
     lidar_prior_loss_weight=1.0,
-    lidar_prior_warmup_iters=0,
 
     lidar_prior_head=dict(
         type="LidarSparseFusionCenterHead",
@@ -454,12 +452,12 @@ train_pipeline = [
         use_dim=5,
         file_client_args=file_client_args,
     ),
-    dict(
-        type='LoadPointsFromMultiSweeps',
-        sweeps_num=10,
-        use_dim=[0, 1, 2, 3, 4],
-        file_client_args=file_client_args,
-    ),
+    # dict(
+    #     type='LoadPointsFromMultiSweeps',
+    #     sweeps_num=10,
+    #     use_dim=[0, 1, 2, 3, 4],
+    #     file_client_args=file_client_args,
+    # ),
     dict(type="LoadMultiViewImageFromFiles", to_float32=True),
     dict(type="ResizeCropFlipImage"),
     dict(
@@ -479,7 +477,7 @@ train_pipeline = [
     dict(type="NuScenesSparse4DAdaptor"),
     dict(type="WrapPoints"),
     dict(
-        type="Collect",
+        type="Collect3D",
         keys=[
             "points",
             "img",
@@ -512,12 +510,12 @@ test_pipeline = [
         use_dim=5,
         file_client_args=file_client_args,
     ),
-    dict(
-        type='LoadPointsFromMultiSweeps',
-        sweeps_num=5,
-        use_dim=[0, 1, 2, 3, 4],
-        file_client_args=file_client_args,
-    ),
+    # dict(
+    #     type='LoadPointsFromMultiSweeps',
+    #     sweeps_num=5,
+    #     use_dim=[0, 1, 2, 3, 4],
+    #     file_client_args=file_client_args,
+    # ),
     dict(type='PointsRangeFilter', point_cloud_range=point_cloud_range),
 
     dict(type="LoadMultiViewImageFromFiles", to_float32=True),
@@ -526,7 +524,7 @@ test_pipeline = [
     dict(type="NuScenesSparse4DAdaptor"),
     dict(type="WrapPoints"),
     dict(
-        type="Collect",
+        type="Collect3D",
         keys=[
             "points",
             "img",

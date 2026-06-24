@@ -66,6 +66,7 @@ class SparseFusion4D(MVXTwoStageDetector):
         use_lidar_prior=False,
         detach_lidar_prior=True,
         lidar_prior_loss_weight=1.0,
+        box3d_head_loss_weight=1.0,
         lidar_prior_warmup_iters=500,
     ):
         super(SparseFusion4D, self).__init__(init_cfg=init_cfg)
@@ -82,40 +83,40 @@ class SparseFusion4D(MVXTwoStageDetector):
         if getattr(self, "freeze_sparse4d_lidar_stage1", False):
             self.freeze_sparse4d_for_lidar_stage1()
         # ===== LiDAR branch =====
-        self.pts_voxel_layer = None
-        self.pts_voxel_encoder = None
-        self.pts_middle_encoder = None
-        self.pts_backbone = None
-        self.pts_neck = None
+        self.pts_voxel_layer = (
+            SPConvVoxelization(**pts_voxel_layer)
+            if pts_voxel_layer is not None
+            else None
+        )
 
-        if pts_voxel_layer is not None:
-            # 你已经从 projects.mmdet3d_plugin import SPConvVoxelization
-            self.pts_voxel_layer = SPConvVoxelization(**pts_voxel_layer)
+        self.pts_voxel_encoder = (
+            build_voxel_encoder(pts_voxel_encoder)
+            if pts_voxel_encoder is not None
+            else None
+        )
 
-        if pts_voxel_encoder is not None:
-            self.pts_voxel_encoder = build_voxel_encoder(
-                pts_voxel_encoder
-            )
+        self.pts_middle_encoder = (
+            build_middle_encoder(pts_middle_encoder)
+            if pts_middle_encoder is not None
+            else None
+        )
 
-        if pts_middle_encoder is not None:
-            self.pts_middle_encoder = build_middle_encoder(
-                pts_middle_encoder
-            )
+        self.pts_backbone = (
+            build_3d_backbone(pts_backbone)
+            if pts_backbone is not None
+            else None
+        )
 
-        if pts_backbone is not None:
-            self.pts_backbone = build_3d_backbone(
-                pts_backbone
-            )
-
-        if pts_neck is not None:
-            self.pts_neck = build_3d_neck(
-                pts_neck
-            )
+        self.pts_neck = (
+            build_3d_neck(pts_neck)
+            if pts_neck is not None
+            else None
+        )
 
         self.use_lidar_prior = use_lidar_prior
         self.detach_lidar_prior = detach_lidar_prior
         self.lidar_prior_loss_weight = lidar_prior_loss_weight
-
+        self.box3d_head_loss_weight = box3d_head_loss_weight
         self.lidar_prior_head = (
             build_from_cfg(lidar_prior_head, MMDET3D_HEADS)
             if lidar_prior_head is not None else None
@@ -150,111 +151,144 @@ class SparseFusion4D(MVXTwoStageDetector):
                 True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7
             )
 
-    def detach_prior_info(self, prior_info):
-        """Detach non-feature prior fields.
+    @classmethod
+    def detach_tensor(cls, tensor):
+        if isinstance(tensor, torch.Tensor):
+            return tensor.detach()
 
-        This function fixes DDP unused-parameter errors without using dummy loss.
+        if isinstance(tensor, list):
+            return [cls.detach_tensor(t) for t in tensor]
 
-        For trainable prior feature generators:
-            cls_embedding / grid_feat_proj / cls_guide_fusion / score_mlp
+        if isinstance(tensor, tuple):
+            return tuple(cls.detach_tensor(t) for t in tensor)
 
-        instance_feats must NOT be detached, otherwise these parameters will not
-        receive gradients from Sparse4D loss.
+        if isinstance(tensor, dict):
+            return {k: cls.detach_tensor(v) for k, v in tensor.items()}
 
-        Non-feature fields are detached to avoid Sparse4D loss flowing back into
-        CenterHead decode / anchors / scores.
+        raise ValueError(f"Unsupported type {type(tensor)}")
+
+    def load_instance_info(
+        self,
+        bs: int,
+        device: torch.device,
+        lidar_instance_prior_info: dict = None,
+        img_meta: dict = None,
+    ) -> dict:
+        """Load LAQ instance queries and append LiDAR prior instances.
+
+        Only LiDAR prior is used. Camera prior is intentionally removed.
         """
-        if prior_info is None:
-            return None
+        instance_info = self.head.instance_bank.get(bs, device)
 
-        out = {}
+        anchor_dims = getattr(self.head.instance_bank, "anchor_dims", None)
 
-        # Default True: train prior instance feature generator through Sparse4D loss.
-        train_prior_instance_feats = getattr(
-            self,
-            "train_prior_instance_feats",
-            True,
-        )
+        if lidar_instance_prior_info is not None:
+            for k, v in lidar_instance_prior_info.items():
+                if k not in ["anchors", "instance_feats"]:
+                    continue
+                if not torch.is_tensor(v):
+                    continue
 
-        for k, v in prior_info.items():
-            if not torch.is_tensor(v):
-                out[k] = v
-                continue
+                v = v.to(device)
 
-            if k == "instance_feats" and train_prior_instance_feats:
-                out[k] = v
+                if k == "anchors" and anchor_dims is not None:
+                    if v.shape[-1] < anchor_dims:
+                        pad_shape = list(v.shape)
+                        pad_shape[-1] = anchor_dims - v.shape[-1]
+                        v = torch.cat([v, v.new_zeros(*pad_shape)], dim=-1)
+                    elif v.shape[-1] > anchor_dims:
+                        v = v[..., :anchor_dims]
+
+                instance_info[f"prior_{k}"] = v
+
+            if "prior_anchors" in instance_info:
+                instance_info["num_prior"] = instance_info["prior_anchors"].shape[1]
+                instance_info["num_lidar_prior"] = instance_info["num_prior"]
             else:
-                out[k] = v.detach()
+                instance_info["num_prior"] = 0
+                instance_info["num_lidar_prior"] = 0
+        else:
+            instance_info["num_prior"] = 0
+            instance_info["num_lidar_prior"] = 0
 
-        return out
+        if getattr(self, "use_temporal", False):
+            instance_info = self.load_temp_info(instance_info, img_meta)
 
-    def _format_points(self, points):
-        """Convert collated LiDARPoints into list[Tensor]."""
-        if points is None:
-            return None
+        return instance_info
 
-        # Debug / non-parallel case: DataContainer may still exist.
-        if hasattr(points, "data"):
-            points = points.data
-
-        # Common collated forms:
-        # [[LiDARPoints(...)]]
-        # [LiDARPoints(...)]
-        if isinstance(points, (list, tuple)) and len(points) == 1:
-            if isinstance(points[0], (list, tuple)):
-                points = points[0]
-
-        formatted_points = []
-        for p in points:
-            if hasattr(p, "tensor"):
-                p = p.tensor
-            formatted_points.append(p)
-
-        return formatted_points
 
     @property
     def with_pts_bbox(self):
         return (
-            hasattr(self, "pts_voxel_layer")
-            and self.pts_voxel_layer is not None
-            and hasattr(self, "pts_voxel_encoder")
+            self.pts_voxel_layer is not None
             and self.pts_voxel_encoder is not None
-            and hasattr(self, "pts_middle_encoder")
             and self.pts_middle_encoder is not None
-            and hasattr(self, "pts_backbone")
             and self.pts_backbone is not None
         )
 
-    @property
-    def with_pts_neck(self):
-        return hasattr(self, "pts_neck") and self.pts_neck is not None
+    def _flatten_point_feats(self, feats):
+        """Flatten multi-scale LiDAR BEV features.
+
+        Args:
+            feats (list[Tensor] | Tensor):
+                Each feature is [B, C, H, W].
+
+        Returns:
+            dict:
+                spatial_shape: [num_level, 2], each row is [H, W]
+                scale_start_index: [num_level]
+                flatten_feats: [B, sum(H*W), C]
+        """
+        if feats is None:
+            return None
+
+        if isinstance(feats, torch.Tensor):
+            feats = [feats]
+
+        spatial_shape = []
+        flatten_feats = []
+
+        for feat in feats:
+            spatial_shape.append(feat.shape[-2:])
+            flatten_feats.append(feat.flatten(2))  # [B, C, H*W]
+
+        flatten_feats = torch.cat(flatten_feats, dim=-1).permute(0, 2, 1).contiguous()
+
+        spatial_shape = torch.tensor(
+            spatial_shape,
+            dtype=torch.int64,
+            device=flatten_feats.device,
+        )
+
+        scale_start_index = spatial_shape[:, 0] * spatial_shape[:, 1]
+        scale_start_index = scale_start_index.cumsum(dim=0)
+        scale_start_index[1:] = scale_start_index[:-1].clone()
+        scale_start_index[0] = 0
+
+        return dict(
+            spatial_shape=spatial_shape,
+            scale_start_index=scale_start_index,
+            flatten_feats=flatten_feats,
+        )
 
     # @force_fp32(apply_to=("img_feats"))
-    def extract_pts_feat(self, pts, img_feats=None, img_metas=None):
-        """Extract BEV features from point clouds."""
-        if not self.with_pts_bbox:
+    def extract_pts_feat(self, points, img_metas=None):
+        """Extract BEV features from point clouds.
+
+        Returns:
+            pts_feats: list[Tensor]
+                Multi-scale BEV feature maps for LiDAR branch.
+        """
+        if not self.with_pts_bbox or points is None:
             return None
 
-        if pts is None:
-            return None
-
-        pts = self._format_points(pts)
-
-        if pts is None or len(pts) == 0:
-            return None
-
-        voxels, num_points, coors = self.voxelize(pts)
+        voxels, num_points, coors = self.voxelize(points)
 
         voxel_features = self.pts_voxel_encoder(
             voxels,
             num_points,
             coors,
-        )
-
-        # Keep the LiDAR branch in FP32. Under fp16 training,
-        # SparseEncoder may output HalfTensor while SECOND/SECONDFPN
-        # weights remain FloatTensor.
-        voxel_features = voxel_features.float()
+        ).float()
 
         batch_size = int(coors[-1, 0].item()) + 1
 
@@ -262,31 +296,26 @@ class SparseFusion4D(MVXTwoStageDetector):
             voxel_features,
             coors,
             batch_size,
-        )
+        ).float()
 
-        x = x.float()
         x = self.pts_backbone(x)
 
-        # SECOND returns multi-scale features as tuple/list.
-        # Convert every feature map to fp32 before SECONDFPN.
         if isinstance(x, (list, tuple)):
             x = [feat.float() for feat in x]
         else:
-            x = x.float()
+            x = [x.float()]
 
         if self.with_pts_neck:
             x = self.pts_neck(x)
 
-        # SECONDFPN usually returns tuple/list as well.
-        if isinstance(x, (list, tuple)):
-            x = [feat.float() for feat in x]
-        else:
-            x = x.float()
+            if isinstance(x, (list, tuple)):
+                x = [feat.float() for feat in x]
+            else:
+                x = [x.float()]
 
         return x
 
     @torch.no_grad()
-    @force_fp32()
     def voxelize(self, points):
         """Apply hard voxelization to points.
 
@@ -376,102 +405,118 @@ class SparseFusion4D(MVXTwoStageDetector):
             )
             depths = None
 
-        pts_feats = None
-        if self.use_lidar_prior:
-            pts_feats = self.extract_pts_feat(
-                points,
-                img_feats=img_feats,
-                img_metas=img_metas,
-            )
+        pts_feats = self.extract_pts_feat(
+            points,
+            img_metas=img_metas,
+        )
+
+        point_feat_info = self._flatten_point_feats(pts_feats)
+        if point_feat_info is not None:
+            flatten_point_feats = point_feat_info.pop("flatten_feats")
+            if metas is not None:
+                metas["point_feats_info"] = point_feat_info
+        else:
+            flatten_point_feats = None
 
         if return_depth:
-            return img_feats, pts_feats, depths
+            return img_feats, pts_feats, flatten_point_feats, depths
 
-        return img_feats, pts_feats
+        return img_feats, pts_feats, flatten_point_feats
 
     def load_instance_info(
         self,
         bs: int,
         device: torch.device,
         lidar_instance_prior_info: dict = None,
-        cam_instance_prior_info: dict = None,
         metainfo: dict = None,
     ) -> dict:
-        """Pack camera / LiDAR prior info into industrial-style instance_info.
+        """Load instance queries from instance bank and append LiDAR prior queries.
 
-        This function only packs prior_* fields.
-        LAQ queries are still generated by self.head.instance_bank.get().
         """
-        instance_info = dict()
-        instance_info["num_prior"] = 0
-        instance_info["num_cam_prior"] = 0
-        instance_info["num_lidar_prior"] = 0
 
-        anchor_dims = getattr(self.head.instance_bank, "anchor_dims", None)
+        instance_bank = self.head.instance_bank
+        instance_info = instance_bank.get(bs, device)
+        anchor_dims = getattr(instance_bank, "anchor_dims", None)
 
-        def _append_prior(prior_info: dict, prior_type: str):
-            nonlocal instance_info
-
-            if prior_info is None:
-                return
-
-            assert "anchors" in prior_info
-            assert "instance_feats" in prior_info
-
-            for k, v in prior_info.items():
+        if lidar_instance_prior_info is not None:
+            for k, v in lidar_instance_prior_info.items():
                 if k not in ["anchors", "instance_feats"]:
                     continue
+
                 if not torch.is_tensor(v):
                     continue
 
                 v = v.to(device)
 
-                if k == "anchors" and anchor_dims is not None:
-                    if v.shape[-1] < anchor_dims:
-                        pad_shape = list(v.shape)
-                        pad_shape[-1] = anchor_dims - v.shape[-1]
-                        v = torch.cat([v, v.new_zeros(*pad_shape)], dim=-1)
-                    elif v.shape[-1] > anchor_dims:
-                        v = v[..., :anchor_dims]
+                if k == "anchors" and v.shape[-1] < anchor_dims:
+                    pad_value = v.new_zeros(*v.shape[:-1], anchor_dims - v.shape[-1])
+                    v = torch.cat([v, pad_value], dim=-1)
 
-                target_key = f"prior_{k}"
-                if target_key in instance_info:
-                    instance_info[target_key] = torch.cat(
-                        [instance_info[target_key], v], dim=1
-                    )
-                else:
-                    instance_info[target_key] = v
+                elif k == "anchors" and v.shape[-1] > anchor_dims:
+                    v = v[..., :anchor_dims]
 
-            for k in ["scores", "labels"]:
-                if k not in prior_info:
-                    continue
-                v = prior_info[k]
-                if not torch.is_tensor(v):
-                    continue
+                instance_info[f"prior_{k}"] = v
 
-                v = v.to(device)
-                target_key = f"prior_{k}"
-                if target_key in instance_info:
-                    instance_info[target_key] = torch.cat(
-                        [instance_info[target_key], v], dim=1
-                    )
-                else:
-                    instance_info[target_key] = v
+            if "prior_anchors" in instance_info:
+                instance_info["num_prior"] = instance_info["prior_anchors"].shape[1]
+            else:
+                instance_info["num_prior"] = 0
+        else:
+            instance_info["num_prior"] = 0
 
-            instance_info["num_prior"] = instance_info["prior_anchors"].shape[1]
-
-            if prior_type == "cam":
-                instance_info["num_cam_prior"] = prior_info["anchors"].shape[1]
-            elif prior_type == "lidar":
-                instance_info["num_lidar_prior"] = prior_info["anchors"].shape[1]
-
-        _append_prior(cam_instance_prior_info, "cam")
-        _append_prior(lidar_instance_prior_info, "lidar")
-
-        if instance_info["num_prior"] == 0:
-            return None
+        # 6. 加载历史实例信息
+        if getattr(self, "use_temporal", False):
+            instance_info = self.load_temp_info(instance_info, metainfo)
 
         return instance_info
+
+    def _update_temporal_instances(
+        self,
+        box3d_pred_dict: dict,
+        metainfo: dict = None,
+        is_training: bool = True,
+    ):
+        if not getattr(self, "use_temporal", False):
+            return None
+
+        instance_bank = self.head.instance_bank
+
+        cls_logits = box3d_pred_dict["cls_logits"]
+
+        if is_training and isinstance(cls_logits, (list, tuple)):
+            cls_logits = cls_logits[-1]
+
+        instance_info = box3d_pred_dict["instance_info"]
+
+        anchors = instance_info["anchors"]
+        instance_feats = instance_info["instance_feats"]
+
+        if hasattr(self.head, "update_anchors"):
+            anchors = self.head.update_anchors(
+                anchors,
+                cls_logits=cls_logits,
+                metainfo=metainfo,
+
+            )
+        elif hasattr(instance_bank, "update_anchors"):
+            anchors = instance_bank.update_anchors(
+                anchors,
+                cls_logits=cls_logits,
+                metainfo=metainfo,
+                update_vel=getattr(self, "with_motion", False),
+            )
+        else:
+            anchors = anchors
+
+        instance_bank.update_temp_instances(
+            instance_feats,
+            anchors,
+            cls_logits,
+            metainfo,
+        )
+
+        return anchors
+
 
     @force_fp32(apply_to=("img",))
     def forward(self, img, points, **data):
@@ -481,7 +526,7 @@ class SparseFusion4D(MVXTwoStageDetector):
             return self.forward_test(img, points, **data)
 
     def forward_train(self, img, points, **data):
-        feature_maps, pts_feats, depths = self.extract_feat(
+        feature_maps, pts_feats, flatten_point_feats, depths = self.extract_feat(
             img=img,
             points=points,
             return_depth=True,
@@ -490,15 +535,11 @@ class SparseFusion4D(MVXTwoStageDetector):
         )
 
         loss_dict = {}
-        instance_info = None
 
+        lidar_instance_prior_info = None
         if self.use_lidar_prior:
-            assert pts_feats is not None, \
-                "use_lidar_prior=True requires valid pts_feats."
-
             lidar_preds = self.lidar_prior_head(pts_feats)
-
-            # 1. LiDAR CenterHead independent loss.
+            
             lidar_loss_dict = self.lidar_prior_head.loss_by_feat(
                 preds_dicts=lidar_preds,
                 gt_bboxes_3d=data["gt_bboxes_3d"],
@@ -507,45 +548,39 @@ class SparseFusion4D(MVXTwoStageDetector):
             )
 
             for k, v in lidar_loss_dict.items():
-                loss_dict[f"lidar_prior.{k}"] = (
-                    v * self.lidar_prior_loss_weight
-                )
+                loss_dict[f'lidar.{k}'] = v * self.lidar_prior_loss_weight
 
-            self.train_iter += 1
-            data["cur_iter"] = self.train_iter
+            lidar_instance_prior_info = self.lidar_prior_head.decode_lidar(
+                self.detach_tensor(lidar_preds),
+                pts_feats,
+                img_metas=data.get("img_metas", None),
+            )
 
-            # 2. Warmup: before warmup, only train LiDAR prior head.
-            if self.train_iter >= self.lidar_prior_warmup_iters:
-                lidar_instance_prior_info = self.lidar_prior_head.decode_lidar(
-                    lidar_preds,
-                    feats=pts_feats,
-                    metainfo=data,
-                )
+            # 1. LiDAR CenterHead independent loss.
 
-                if self.detach_lidar_prior:
-                    lidar_instance_prior_info = self.detach_prior_info(
-                        lidar_instance_prior_info
-                    )
+        instance_info = self.load_instance_info(
+            bs=feature_maps[0].shape[0],
+            device=feature_maps[0].device,
+            lidar_instance_prior_info=lidar_instance_prior_info,
+            img_metas=data.get("img_metas", None),
+        )
+        
 
-                instance_info = self.load_instance_info(
-                    bs=img.shape[0],
-                    device=feature_maps[0].device,
-                    lidar_instance_prior_info=lidar_instance_prior_info,
-                    cam_instance_prior_info=None,
-                    metainfo=data,
-                )
-
-        # Important:
-        # Use industrial-style instance_info, not lidar_prior_info.
         data["instance_info"] = instance_info
         data["lidar_prior_info"] = None
 
-        # Stage-1: no LiDAR DFFA feature fusion.
-        data["pts_feats"] = None
+        model_outs = self.head(feature_maps, 
+                                instance_info,
+                                metas=data,
+                                ms_point_feats=flatten_point_feats
+                                )
+        self._update_temporal_instances(model_outs, 
+                                        img_metas=data.get("img_metas", None),
+                                        is_training=True)
 
-        model_outs = self.head(feature_maps, data)
         sparse4d_loss_dict = self.head.loss(model_outs, data)
-        loss_dict.update(sparse4d_loss_dict)
+        for k, v in sparse4d_loss_dict.items():
+            loss_dict[k] = v * self.box3d_head_loss_weight
 
         if depths is not None and "gt_depth" in data:
             loss_dict["loss_dense_depth"] = self.depth_branch.loss(

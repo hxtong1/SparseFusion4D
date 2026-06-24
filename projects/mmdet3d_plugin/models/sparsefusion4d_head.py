@@ -1,5 +1,5 @@
 # Copyright (c) Horizon Robotics. All rights reserved.
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 from collections import defaultdict
 import warnings
 import copy
@@ -53,16 +53,6 @@ class SparseFusion4DHead(BaseModule):
         dn_loss_weight: float = 5.0,
         decouple_attn: bool = True,
         init_cfg: dict = None,
-
-        # ===== LiDAR BEV feature adapter =====
-        use_pts_feat: bool = False,
-        use_lidar_prior_query: bool = True,
-        lidar_prior_score_thr: float = 0.01,
-        lidar_prior_feat_scale: float = 0.2,
-        cache_lidar_prior: bool = False,
-        output_lidar_prior: bool = False,
-        pts_in_channels: int = 512,
-        pts_out_channels: int = 256,
         **kwargs,
     ):
         super(SparseFusion4DHead, self).__init__(init_cfg)
@@ -122,14 +112,6 @@ class SparseFusion4DHead(BaseModule):
         )
         self.embed_dims = self.instance_bank.embed_dims
 
-        # ---------------------------------------------------------
-        # Industrial-style pre-decoder path.
-        # No extra config switch. If LiDAR prior exists, it is first
-        # used as temp memory to update LAQ before the main decoder.
-        # This reuses existing Sparse4D temp_gnn + norm modules.
-        # ---------------------------------------------------------
-        self.pre_layer = None
-        self.pre_norm = None
 
         temp_idx = None
         for _op_name in ["temp_gnn", "temp_cross_attn", "temporal_cross_attn"]:
@@ -152,22 +134,6 @@ class SparseFusion4DHead(BaseModule):
             else:
                 self.pre_norm = nn.ModuleList([nn.LayerNorm(self.embed_dims)])
 
-        self.use_pts_feat = use_pts_feat
-        self.use_lidar_prior_query = use_lidar_prior_query
-        self.lidar_prior_score_thr = lidar_prior_score_thr
-        self.lidar_prior_feat_scale = lidar_prior_feat_scale
-        self.cache_lidar_prior = cache_lidar_prior
-        self.output_lidar_prior = output_lidar_prior
-
-        self.pts_adapter = None
-        if self.use_pts_feat:
-            self.pts_adapter = nn.Conv2d(
-                pts_in_channels,
-                pts_out_channels,
-                kernel_size=1,
-                bias=False,
-            )
-
         if self.decouple_attn:
             self.fc_before = nn.Linear(
                 self.embed_dims, self.embed_dims * 2, bias=False
@@ -187,267 +153,13 @@ class SparseFusion4DHead(BaseModule):
                 for p in self.layers[i].parameters():
                     if p.dim() > 1:
                         nn.init.xavier_uniform_(p)
+        for param in self.anchor_encoder.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_uniform_(param)
+
         for m in self.modules():
-            if hasattr(m, "init_weight"):
+            if hasattr(m, "init_weight") and m != self:
                 m.init_weight()
-
-    def _align_prior_anchor_dim(self, prior_anchor, target_dim):
-        if prior_anchor is None:
-            return None
-
-        if prior_anchor.shape[-1] < target_dim:
-            pad = prior_anchor.new_zeros(
-                *prior_anchor.shape[:-1],
-                target_dim - prior_anchor.shape[-1],
-            )
-            prior_anchor = torch.cat([prior_anchor, pad], dim=-1)
-        elif prior_anchor.shape[-1] > target_dim:
-            prior_anchor = prior_anchor[..., :target_dim]
-
-        return prior_anchor
-
-
-    def _call_pre_temp_attn(
-        self,
-        temp_attn,
-        query_feature,
-        query_anchor,
-        query_anchor_embed,
-        temp_feature,
-        temp_anchor,
-        temp_anchor_embed,
-    ):
-        """Reuse current Sparse4D temp attention exactly like graph_model().
-
-        This is the Sparse4D v3 adaptation of the industrial pre_decoder:
-        query = LAQ, key/value = LiDAR prior memory.
-        No newly-designed attention module is introduced here.
-        """
-        query = query_feature
-        key = temp_feature
-        value = temp_feature
-        query_pos = query_anchor_embed
-        key_pos = temp_anchor_embed
-
-        if self.decouple_attn:
-            query = torch.cat([query, query_pos], dim=-1)
-            key = torch.cat([key, key_pos], dim=-1)
-            query_pos, key_pos = None, None
-
-        if value is not None:
-            value = self.fc_before(value)
-
-        out = temp_attn(
-            query,
-            key,
-            value,
-            query_pos=query_pos,
-            key_pos=key_pos,
-            attn_mask=None,
-        )
-        if isinstance(out, tuple):
-            out = out[0]
-
-        return self.fc_after(out)
-
-
-    def forward_pre_decoder(
-        self,
-        laq_anchor,
-        laq_instance_feature,
-        instance_info,
-    ):
-        """
-        Industrial-style prior preprocessing.
-
-        Equivalent semantic from industrial Spares3DHead.forward_pre_decoder:
-
-            pre_info = prepare_instance_info(laq_info, prop_info)
-            pre_info['temp_anchors'] = instance_info['prior_anchors']
-            pre_info['temp_instance_feats'] = instance_info['prior_instance_feats']
-            pre_info['temp_attn_mask'] = None
-
-        In current Sparse4D v3 adaptation:
-            query = LAQ
-            temp memory = LiDAR prior
-            output = updated LAQ
-        """
-
-        if instance_info is None:
-            return laq_anchor, laq_instance_feature
-
-        if self.pre_layer is None or len(self.pre_layer) == 0:
-            return laq_anchor, laq_instance_feature
-
-        if "prior_anchors" not in instance_info:
-            return laq_anchor, laq_instance_feature
-
-        if "prior_instance_feats" not in instance_info:
-            return laq_anchor, laq_instance_feature
-
-        prior_anchor = instance_info["prior_anchors"]
-        prior_feature = instance_info["prior_instance_feats"]
-
-        if prior_anchor is None or prior_feature is None:
-            return laq_anchor, laq_instance_feature
-
-        if prior_anchor.shape[1] == 0:
-            return laq_anchor, laq_instance_feature
-
-        prior_anchor = self._align_prior_anchor_dim(
-            prior_anchor,
-            laq_anchor.shape[-1],
-        )
-
-        prior_feature = torch.nan_to_num(
-            prior_feature,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        query_anchor_embed = self.anchor_encoder(laq_anchor)
-        temp_anchor_embed = self.anchor_encoder(prior_anchor)
-
-        query_feature = laq_instance_feature
-
-        for temp_attn, temp_norm in zip(self.pre_layer, self.pre_norm):
-            query_feature = self._call_pre_temp_attn(
-                temp_attn=temp_attn,
-                query_feature=query_feature,
-                query_anchor=laq_anchor,
-                query_anchor_embed=query_anchor_embed,
-                temp_feature=prior_feature,
-                temp_anchor=prior_anchor,
-                temp_anchor_embed=temp_anchor_embed,
-            )
-            query_feature = temp_norm(query_feature)
-
-        return laq_anchor, query_feature
-
-    def merge_lidar_prior_query(
-        self,
-        anchor: torch.Tensor,
-        instance_feature: torch.Tensor,
-        lidar_prior_info,
-    ):
-        """Merge Sparse4D bank query and LiDAR prior query with source states.
-
-        Query order:
-            [bank_query, lidar_prior_query]
-
-        query_source:
-            0 = bank / learnable / temporal query
-            1 = LiDAR prior query
-        """
-        B, N_bank = anchor.shape[:2]
-
-        bank_valid_mask = torch.ones(
-            (B, N_bank),
-            dtype=torch.bool,
-            device=anchor.device,
-        )
-        bank_query_source = torch.zeros(
-            (B, N_bank),
-            dtype=torch.long,
-            device=anchor.device,
-        )
-
-        if lidar_prior_info is None:
-            return (
-                anchor,
-                instance_feature,
-                0,
-                bank_valid_mask,
-                bank_query_source,
-            )
-
-        prior_anchor = lidar_prior_info["anchors"]
-        prior_feature = lidar_prior_info["instance_feats"]
-        prior_scores = lidar_prior_info.get("scores", None)
-
-        prior_anchor = prior_anchor.to(device=anchor.device, dtype=anchor.dtype)
-        prior_feature = prior_feature.to(
-            device=instance_feature.device,
-            dtype=instance_feature.dtype,
-        )
-
-        anchor_dim = anchor.shape[-1]
-        feat_dim = instance_feature.shape[-1]
-
-        if prior_anchor.shape[-1] < anchor_dim:
-            pad = prior_anchor.new_zeros(
-                *prior_anchor.shape[:-1],
-                anchor_dim - prior_anchor.shape[-1],
-            )
-            prior_anchor = torch.cat([prior_anchor, pad], dim=-1)
-        elif prior_anchor.shape[-1] > anchor_dim:
-            prior_anchor = prior_anchor[..., :anchor_dim]
-
-        if prior_feature.shape[-1] != feat_dim:
-            raise RuntimeError(
-                f"LiDAR prior feature dim {prior_feature.shape[-1]} "
-                f"!= instance feature dim {feat_dim}"
-            )
-
-        prior_anchor = torch.nan_to_num(
-            prior_anchor,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        prior_feature = torch.nan_to_num(
-            prior_feature,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        B, N_prior = prior_anchor.shape[:2]
-
-        if prior_scores is not None:
-            prior_scores = prior_scores.to(device=anchor.device)
-            prior_scores = torch.nan_to_num(
-                prior_scores,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            prior_valid_mask = prior_scores > self.lidar_prior_score_thr
-        else:
-            prior_valid_mask = torch.ones(
-                (B, N_prior),
-                dtype=torch.bool,
-                device=anchor.device,
-            )
-
-        # 工业代码里 prior 有 valid_mask；当前 Sparse4D attention mask 不完全兼容 B,N,N，
-        # 所以先把 invalid prior feature 置零，并用 feature scale 降低扰动。
-        prior_feature = prior_feature * prior_valid_mask.unsqueeze(-1).to(
-            prior_feature.dtype
-        )
-        # prior_feature = prior_feature * self.lidar_prior_feat_scale
-
-        prior_query_source = torch.ones(
-            (B, N_prior),
-            dtype=torch.long,
-            device=anchor.device,
-        )
-
-        anchor = torch.cat([anchor, prior_anchor], dim=1)
-        instance_feature = torch.cat([instance_feature, prior_feature], dim=1)
-        valid_mask = torch.cat([bank_valid_mask, prior_valid_mask], dim=1)
-        query_source = torch.cat([bank_query_source, prior_query_source], dim=1)
-
-        return (
-            anchor,
-            instance_feature,
-            N_prior,
-            valid_mask,
-            query_source,
-        )
-
-
 
     def graph_model(
         self,
@@ -480,32 +192,14 @@ class SparseFusion4DHead(BaseModule):
     def forward(
         self,
         feature_maps: Union[torch.Tensor, List],
-        metas: dict,
+        instance_info: Dict[str, torch.Tensor],
+        metas: Dict[str, torch.Tensor],
+        ms_point_feats: torch.Tensor=None,
     ):
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
 
-        # Current training iteration passed from detector.
-        # Used for prior feature scale ramp-up.
-        self._cur_iter = metas.get("cur_iter", None)
-
-
-
-
-        pts_feats = metas.get("pts_feats", None)
-        if self.use_pts_feat and pts_feats is not None:
-            if isinstance(pts_feats, torch.Tensor):
-                pts_feats = [pts_feats]
-
-            # Keep LiDAR BEV features in fp32 before Conv2d adapter.
-            pts_feats = [self.pts_adapter(x.float()) for x in pts_feats]
-            pts_feats = [x.float() for x in pts_feats]
-            metas["pts_feats"] = pts_feats
-
-        # =========================================================
-        # 1. Get LAQ / bank queries from Sparse4D instance bank.
-        # =========================================================
         if (
             self.sampler.dn_metas is not None
             and self.sampler.dn_metas["dn_anchor"].shape[0] != batch_size
@@ -523,45 +217,6 @@ class SparseFusion4DHead(BaseModule):
             metas,
             dn_metas=self.sampler.dn_metas,
         )
-
-        # =========================================================
-        # 2. Industrial-style LiDAR prior preprocessing.
-        #    Prior is NOT concatenated into the main decoder as an
-        #    ordinary query. It is first used as temp memory to update
-        #    LAQ, following the industrial forward_pre_decoder design.
-        # =========================================================
-        detector_instance_info = metas.get("instance_info", None)
-
-        laq_anchor, laq_instance_feature = self.forward_pre_decoder(
-            laq_anchor=laq_anchor,
-            laq_instance_feature=laq_instance_feature,
-            instance_info=detector_instance_info,
-        )
-
-        laq_info = dict(
-            anchors=laq_anchor,
-            instance_feats=laq_instance_feature,
-        )
-
-        # Main decoder receives LAQ only at this stage.
-        # Do not pass LiDAR prior into prepare_instance_info here.
-        query_info = self.prepare_instance_info(
-            laq_info=laq_info,
-            prior_info=None,
-            prop_info=None,
-        )
-
-        anchor = query_info["anchors"]
-        instance_feature = query_info["instance_feats"]
-        query_valid_mask = query_info["valid_mask"]
-        query_source = query_info["query_source"]
-
-        num_laq = query_info["num_laq"]
-        num_prior = query_info["num_prior"]
-        num_prop = query_info["num_prop"]
-        num_lidar_prior = query_info["num_lidar_prior"]
-        num_cam_prior = query_info["num_cam_prior"]
-        num_anchors = query_info["num_anchors"]
 
         # ========= prepare for denoising training ============
         attn_mask = None

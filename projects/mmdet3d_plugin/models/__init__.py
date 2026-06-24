@@ -4,7 +4,6 @@ from .sparsefusion4d import SparseFusion4D
 from .sparsefusion4d_head import SparseFusion4DHead
 from .blocks import (
     DeformableFeatureAggregation,
-    # DeformableFeatureFusionAggregation,
     DenseDepthNet,
     AsymmetricFFN,
 )
